@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      1.5
+// @version      1.6
 // @description  Conducts one Arena battle with the current team against any suggested opponent (except guildmates). Adds a checkbox to the "Do All" form and a button to the "Actions" menu.
 // @description:ru Проводит один бой на арене текущей пачкой с любым предложенным соперником (кроме согильдийца). Добавляет галочку в форму "Сделать всё" и кнопку в меню "Действия".
 // @author       emz13666
@@ -31,7 +31,8 @@ const LOG = '[HWHOneArenaBattle]';
 async function waitForHelper(timeout = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-        if (globalThis.HWHClasses && globalThis.HWHFuncs && globalThis.HWHData && globalThis.Caller) {
+        const g = globalThis;
+        if (g.HWHClasses && g.HWHFuncs && g.HWHFuncs.addExtentionName && g.HWHData && g.Caller) {
             return true;
         }
         await new Promise(r => setTimeout(r, 500));
@@ -46,8 +47,7 @@ if (!found) {
 
 console.log(`%cStart Extension ${GM_info.script.name}, v${GM_info.script.version} by ${GM_info.script.author}`, 'color: #ffd24d');
 try {
-    const { addExtentionName } = HWHFuncs;
-    addExtentionName(GM_info.script.name, GM_info.script.version, GM_info.script.author);
+    globalThis.HWHFuncs.addExtentionName(GM_info.script.name, GM_info.script.version, GM_info.script.author);
 } catch (e) {
     console.warn(LOG + ' Не удалось зарегистрировать расширение в HWH:', e);
 }
@@ -125,10 +125,11 @@ async function runOneArenaBattle() {
             if (r.win) {
                 console.log(LOG, `ПОБЕДА: ${r.oldPlace} → ${r.newPlace}`);
             } else {
-                console.log(LOG, `ПОРАЖЕНИЕ (место: ${r.oldPlace})`);
+                console.log(LOG, `ПОРАЖЕНИЕ${r.oldPlace ? ` (место: ${r.oldPlace})` : ''}`);
             }
             console.log(LOG, 'результат боя:', {
                 win: r.win,
+                stars: r.stars,
                 oldPlace: r.oldPlace,
                 newPlace: r.newPlace,
                 enemyPlace: r.enemyPlace,
@@ -161,7 +162,7 @@ function installArenaButton() {
 }
 
 /* ================================================================  /
-/  🔥 ГАЛОЧКА В "СДЕЛАТЬ ВСЁ"                                      /
+/  🔥 ГАЛОЧКА В "СДЕЛАТЬ ВСЁ" (после "Пройти подземелье")          /
 /  ================================================================ */
 function patchDoYourBest() {
     const Original = HWHClasses.doYourBest;
@@ -169,18 +170,25 @@ function patchDoYourBest() {
     class Patched extends Original {
         constructor(...args) {
             super(...args);
-            this.funcList.push({
+            const newItem = {
                 name: 'oneArenaBattle',
                 label: 'Провести 1 бой на арене',
                 title: 'Провести 1 бой на арене текущей пачкой',
                 checked: false,
-            });
+            };
+            // Вставляем после пункта "Пройти подземелье" (testDungeon)
+            const idx = this.funcList.findIndex(f => f.name === 'testDungeon');
+            if (idx >= 0) {
+                this.funcList.splice(idx + 1, 0, newItem);
+            } else {
+                this.funcList.push(newItem);
+            }
             this.functions.oneArenaBattle = runOneArenaBattle;
         }
     }
     Patched.__patched = true;
     HWHClasses.doYourBest = Patched;
-    console.log(LOG, 'галочка добавлена в форму "Сделать всё"');
+    console.log(LOG, 'галочка добавлена в форму "Сделать всё" (после "Пройти подземелье")');
     return true;
 }
 
