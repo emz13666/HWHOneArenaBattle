@@ -23,6 +23,7 @@
 (async function () {
   'use strict';
 
+  const LOG = '[HWH One Arena]';
   const SCRIPT_NAME = GM_info.script.name;
   const SCRIPT_VER = GM_info.script.version;
   const SCRIPT_AUTHOR = GM_info.script.author;
@@ -43,11 +44,16 @@
   }
 
   if (!await waitForHelper()) {
-    console.log('%c[HWH One Arena] HeroWarsHelper не найден', 'color: red');
+    console.log('%c' + LOG + ' HeroWarsHelper не найден', 'color: red');
     return;
   }
 
-  try { HWHFuncs.addExtentionName(SCRIPT_NAME, SCRIPT_VER, SCRIPT_AUTHOR); } catch (e) {}
+  try {
+    HWHFuncs.addExtentionName(SCRIPT_NAME, SCRIPT_VER, SCRIPT_AUTHOR);
+    console.log(LOG, 'зарегистрировано как расширение:', SCRIPT_NAME, 'v' + SCRIPT_VER, 'by', SCRIPT_AUTHOR);
+  } catch (e) {
+    console.warn(LOG, 'не удалось зарегистрировать расширение:', e);
+  }
 
   const { Caller, HWHFuncs, HWHClasses, HWHData } = globalThis;
 
@@ -86,13 +92,14 @@
           range = await Caller.send({ name: 'arenaCheckTargetRange', args: { ids } });
         } catch (e) { range = {}; }
         const inRange = filtered.filter(e => range[e.userId] !== false);
-        if (inRange.length > 0) return inRange[0];
+        if (inRange.length > 0) {
+          console.log(LOG, `найден соперник с попытки ${attempt}:`, inRange[0].user?.name || inRange[0].userId);
+          return inRange[0];
+        }
       }
 
+      console.log(LOG, `попытка ${attempt}/${maxAttempts}: подходящих соперников нет (все из гильдии или вне зоны)`);
       if (attempt < maxAttempts) {
-        HWHFuncs.setProgress(
-          `Арена: все соперники из гильдии или вне зоны, обновляем (${attempt}/${maxAttempts})...`
-        );
         await new Promise(r => setTimeout(r, delayMs));
       }
     }
@@ -100,29 +107,33 @@
   }
 
   async function runOneArenaBattle() {
-    HWHFuncs.setProgress('Арена: подготовка...');
+    console.log(LOG, '=== запуск одного боя на арене ===');
     try {
       const { heroes, pet, favor, banners, userGetInfo } = await getArenaPack();
       if (!heroes.length) throw new Error('Не задана пачка для арены');
+      console.log(LOG, 'пачка:', { heroes, pet, favor, banners });
       const myClanId = userGetInfo && userGetInfo.clanId;
       const enemy = await pickEnemy(myClanId);
-      HWHFuncs.setProgress(`Арена: бой с ${enemy.user?.name || enemy.userId}...`);
+      console.log(LOG, 'бой с', enemy.user?.name || enemy.userId);
       const args = { userId: +enemy.userId, heroes, favor };
       if (pet) args.pet = pet;
       if (banners && banners.length) args.banners = banners;
       const result = await Caller.send({ name: 'arenaAttack', args });
       const battle = result && result.battles && result.battles[0];
       const r = battle && battle.result;
-      const msg = r
-        ? (r.win
-            ? `Арена: победа! ${r.oldPlace} → ${r.newPlace}`
-            : `Арена: поражение (${r.oldPlace})`)
-        : 'Арена: бой завершён';
-      HWHFuncs.setProgress(msg, 5000);
+      if (r) {
+        if (r.win) {
+          console.log(LOG, `ПОБЕДА: ${r.oldPlace} → ${r.newPlace}`);
+        } else {
+          console.log(LOG, `ПОРАЖЕНИЕ (место: ${r.oldPlace})`);
+        }
+      } else {
+        console.log(LOG, 'бой завершён (результат не получен)');
+      }
+      console.log(LOG, 'ответ сервера:', result);
       return r && r.win;
     } catch (e) {
-      HWHFuncs.setProgress('Арена: ошибка — ' + e.message, 5000);
-      console.error('[HWH One Arena]', e);
+      console.error(LOG, 'ошибка:', e);
       return false;
     }
   }
@@ -137,6 +148,7 @@
       result() { runOneArenaBattle(); },
       color: 'red',
     });
+    console.log(LOG, 'кнопка добавлена в меню "Действия"');
   }
 
   function patchDoYourBest() {
@@ -156,6 +168,7 @@
     }
     Patched.__patched = true;
     HWHClasses.doYourBest = Patched;
+    console.log(LOG, 'галочка добавлена в форму "Сделать всё"');
   }
 
   installArenaButton();
@@ -167,5 +180,5 @@
     });
   } catch (e) {}
 
-  console.log(`%c[${SCRIPT_NAME}] v${SCRIPT_VER} готов`, 'color: #7fff7f');
+  console.log(`%c${LOG} v${SCRIPT_VER} готов`, 'color: #7fff7f');
 })();
