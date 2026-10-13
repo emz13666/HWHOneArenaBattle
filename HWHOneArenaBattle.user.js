@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      1.7
+// @version      1.8
 // @description  Conducts one Arena battle with the current team against any suggested opponent (except guildmates). Adds a checkbox to the "Do All" form and a button to the "Actions" menu.
 // @description:ru Проводит один бой на арене текущей пачкой с любым предложенным соперником (кроме согильдийца). Добавляет галочку в форму "Сделать всё" и кнопку в меню "Действия".
 // @author       emz13666
@@ -108,13 +108,16 @@ async function pickEnemy(myClanId, maxAttempts = 10, delayMs = 1500) {
 
 async function runOneArenaBattle() {
     console.log(LOG, '=== запуск одного боя на арене ===');
+    HWHFuncs.setProgress('Арена: подготовка...');
     try {
         const { heroes, pet, favor, banners, userGetInfo } = await getArenaPack();
         if (!heroes.length) throw new Error('Не задана пачка для арены');
         console.log(LOG, 'пачка:', { heroes, pet, favor, banners });
         const myClanId = userGetInfo && userGetInfo.clanId;
+        HWHFuncs.setProgress('Арена: поиск соперника...');
         const enemy = await pickEnemy(myClanId);
         console.log(LOG, 'бой с', enemy.user?.name || enemy.userId);
+        HWHFuncs.setProgress(`Арена: бой с ${enemy.user?.name || enemy.userId}...`);
         const args = { userId: +enemy.userId, heroes, favor };
         if (pet) args.pet = pet;
         if (banners && banners.length) args.banners = banners;
@@ -124,8 +127,10 @@ async function runOneArenaBattle() {
         if (r) {
             if (r.win) {
                 console.log(LOG, `ПОБЕДА: ${r.oldPlace} → ${r.newPlace}`);
+                HWHFuncs.setProgress(`Арена: ПОБЕДА ${r.oldPlace ?? '?'} → ${r.newPlace ?? '?'}`, 5000);
             } else {
                 console.log(LOG, `ПОРАЖЕНИЕ${r.oldPlace ? ` (место: ${r.oldPlace})` : ''}`);
+                HWHFuncs.setProgress(`Арена: ПОРАЖЕНИЕ${r.oldPlace ? ` (${r.oldPlace})` : ''}`, 5000);
             }
             console.log(LOG, 'результат боя:', {
                 win: r.win,
@@ -136,10 +141,12 @@ async function runOneArenaBattle() {
             });
         } else {
             console.log(LOG, 'бой завершён (результат не получен)');
+            HWHFuncs.setProgress('Арена: бой завершён', 5000);
         }
         return r && r.win;
     } catch (e) {
         console.error(LOG, 'ошибка:', e);
+        HWHFuncs.setProgress('Арена: ошибка — ' + e.message, 5000);
         return false;
     }
 }
@@ -176,7 +183,6 @@ function patchDoYourBest() {
                 title: 'Провести 1 бой на арене текущей пачкой',
                 checked: false,
             };
-            // Вставляем после пункта "Пройти подземелье" (testDungeon)
             const idx = this.funcList.findIndex(f => f.name === 'testDungeon');
             if (idx >= 0) {
                 this.funcList.splice(idx + 1, 0, newItem);
