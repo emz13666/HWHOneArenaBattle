@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      1.2
+// @version      1.3
 // @description  Conducts one Arena battle with the current team against any suggested opponent (except guildmates). Adds a checkbox to the "Do All" form and a button to the "Actions" menu.
 // @description:ru Проводит один бой на арене текущей пачкой с любым предложенным соперником (кроме согильдийца). Добавляет галочку в форму "Сделать всё" и кнопку в меню "Действия".
 // @author       emz13666
@@ -23,14 +23,20 @@
 (async function () {
   'use strict';
 
-  const SCRIPT_NAME = 'HWH One Arena Battle';
-  const SCRIPT_VER = '1.2';
-  const SCRIPT_AUTHOR = 'you';
+  const SCRIPT_NAME = GM_info.script.name;
+  const SCRIPT_VER = GM_info.script.version;
+  const SCRIPT_AUTHOR = GM_info.script.author;
 
   async function waitForHelper(timeout = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      if (globalThis.HWHFuncs && globalThis.HWHClasses && globalThis.HWHData && globalThis.Caller) return true;
+      if (
+        globalThis.HWHFuncs &&
+        globalThis.HWHClasses &&
+        globalThis.HWHClasses.doYourBest &&
+        globalThis.HWHData &&
+        globalThis.Caller
+      ) return true;
       await new Promise(r => setTimeout(r, 500));
     }
     return false;
