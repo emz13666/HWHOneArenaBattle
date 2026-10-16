@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.4
+// @version      4.5
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -20,6 +20,7 @@
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
 
+
 (async function () {
 'use strict';
 
@@ -33,7 +34,6 @@ const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
 const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
 const SIM_COUNT = 10;
 const MIN_PROBABILITY_TO_SAVE = 0.6;
-const HISTORY_PAGE_LIMIT = 20;
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
     grandArena: { battle: 21, cooldown: 20, maxTries: 5, label: 'Гранд-Арена' },
@@ -168,43 +168,7 @@ async function openFriendlyClansDialog() {
         label: `${clans[id]} (id ${id})`,
         checked: friends.includes(id),
     }));
-if (!document.getElementById('hwh-arena-friend-btns')) {
-    const st = document.createElement('style');
-    st.id = 'hwh-arena-friend-btns';
-    st.textContent = `
-        /* Сокет и ряд растягиваем на всю ширину, но с внутренними отступами */
-        .PopUp_blocks > .PopUp_btnSocket:has(.arenaFriendBtn) {
-            align-self: stretch;
-            width: 100%;
-            box-sizing: border-box;
-            padding: 4px 6px 6px 6px;
-        }
-        .PopUp_blocks > .PopUp_btnSocket > .PopUp_btnRow {
-            width: 100%;
-            box-sizing: border-box;
-            gap: 4px;               /* отступ между кнопками */
-        }
-
-        /* Кнопки одинаковой ширины, ничего не вылезает */
-        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn {
-            flex: 1 1 0;
-            min-width: 0;
-            box-sizing: border-box;
-            padding-left: 0;
-            padding-right: 0;
-        }
-        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate {
-            width: 100%;
-            min-width: 0;
-            box-sizing: border-box;
-            padding-left: 4px;
-            padding-right: 4px;
-            font-size: 14px;
-            white-space: nowrap;
-        }
-    `;
-    document.head.appendChild(st);
-}
+    ensureFriendBtnStyle();
     const result = await HWHFuncs.popup.confirm(
         `Дружественные гильдии (${ids.length})`,
       [
@@ -236,7 +200,7 @@ function isEnemyAllowed(enemy, myClanId, noAttackFriendly) {
     return true;
 }
 
-/* ===== БАННЕРЫ ===== */
+/* ===== ФЛАГИ ===== */
 function getBannersFromGame() {
     try {
         const g = cheats.getSelfGame();
@@ -269,7 +233,7 @@ function getBannersFromGame() {
         }
         return list;
     } catch (e) {
-        console.warn(LOG, 'не удалось прочитать баннеры:', e);
+        console.warn(LOG, 'не удалось прочитать флаги:', e);
         return [];
     }
 }
@@ -284,7 +248,7 @@ function pickBestBannerId() {
     const top = sorted[0];
     const equals = sorted.filter(b => b.slotsCount === top.slotsCount && b.colorCounts.every((v, i) => v === top.colorCounts[i]));
     const picked = equals[Math.floor(Math.random() * equals.length)];
-    console.log(LOG, `равнозначных: ${equals.length} [${equals.map(b => b.id).join(', ')}], выбран: ${picked.id}`);
+    console.log(LOG, `равнозначных флагов: ${equals.length} [${equals.map(b => b.id).join(', ')}], выбран: ${picked.id}`);
     return picked.id;
 }
 
@@ -316,7 +280,7 @@ function handleRefillError(e, kind) {
         HWHFuncs.setProgress(`${label}: подожди ${delta} сек`, 5000);
         return true;
     }
-    if (msg.includes('NotEnough') && msg.includes('Refillable ' + ref.battle)) {
+    if (msg.includes('NotEnough') && msg.includes('Refillable ' + String(ref.battle))) {
         console.log(LOG, `${ref.label}: нет попыток`);
         HWHFuncs.setProgress(`${ref.label}: нет попыток`, 5000);
         return true;
@@ -329,7 +293,7 @@ function reportBattleResult(result, label, kind) {
     const isGrand = kind === 'grandArena';
     const battles = result?.battles || [];
     const appliedBanners = battles.map(b => b?.effects?.attackersBanner?.id).filter(Boolean);
-    if (appliedBanners.length) console.log(LOG, `сервер применил баннеры: [${appliedBanners.join(', ')}]`);
+    if (appliedBanners.length) console.log(LOG, `сервер применил флаги: [${appliedBanners.join(', ')}]`);
 
     if (isGrand) {
         const total = battles.length;
@@ -386,7 +350,6 @@ async function calcProbability(battle, N = SIM_COUNT) {
         } catch (e) {
             console.warn(LOG, `симуляция ${i + 1}/${N} упала:`, e.message);
         }
-        await new Promise(r => setTimeout(r, 20));
     }
     if (total === 0) return null;
     return wins / total;
@@ -450,19 +413,6 @@ async function saveBattleToDB(record) {
 /* ================================================================= */
 /* === ИМПОРТ ИСТОРИИ АРЕНЫ ИЗ battleGetByType (v4.3)              === */
 /* ================================================================= */
-
-async function isBattleSavedByReplayId(replayId) {
-    if (!replayId) return false;
-    try {
-        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
-        await myDb.open();
-        const all = await dbGetAll(myDb);
-        return all.some(r => String(r.replayId) === String(replayId));
-    } catch (e) {
-        return false;
-    }
-}
-
 function extractPackFromTeam(teamObj) {
     const ids = Object.values(teamObj || {})
         .map(u => u && u.id)
@@ -522,13 +472,22 @@ async function calcProbabilityForReplay(replay) {
     }
 }
 
-async function importArenaHistoryFromServer() {
+async function importArenaHistoryFromServer(maxPages = Infinity) {
+    if (!HWHClasses.Database) {
+        console.log(LOG, 'импорт: HWHClasses.Database недоступен');
+        return 0;
+    }
     const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
     if (!myUserId) {
         console.log(LOG, 'импорт истории: нет userInfo.id');
         HWHFuncs.setProgress('История: нет userInfo.id', 4000);
         return 0;
     }
+    const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+    await myDb.open();
+    const existingIds = new Set(
+        (await dbGetAll(myDb)).map(r => String(r.replayId)).filter(Boolean)
+    );
 
     const LIMIT = 20; // сервер не принимает > 20
     let totalImported = 0;
@@ -547,7 +506,7 @@ async function importArenaHistoryFromServer() {
 
         console.log(LOG, `--- источник: ${source} (type=${type}) ---`);
 
-        while (true) {
+        while (page < maxPages) {
             page++;
             let resp;
             try {
@@ -571,23 +530,20 @@ async function importArenaHistoryFromServer() {
             }
 
             for (const replay of replays) {
+                if (existingIds.has(String(replay.id))) { totalDuplicates++; continue; }
                 const records = convertReplayToRecords(replay, myUserId, source);
                 if (!records) {
                     totalForeign++;
                     continue;
                 }
-                if (await isBattleSavedByReplayId(replay.id)) {
-                    totalDuplicates++;
-                    continue;
-                }
-
+               
                 const prob = await calcProbabilityForReplay(replay);
 
                 if (prob !== null && prob < MIN_PROBABILITY_TO_SAVE) {
                     totalSkippedLowProb++;
                     console.log(
                         LOG,
-                        `импорт: пропущен replayId=${replay.id} — probability ${(prob * 100).toFixed(0)}% < ${(MIN_PROBABILITY_TO_SAVE * 100)}%`
+                        `импорт: пропущен replayId=${replay.id} — probability ${(prob * 100).toFixed(0)}% < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`
                     );
                     continue;
                 }
@@ -595,7 +551,9 @@ async function importArenaHistoryFromServer() {
                 for (const rec of records) {
                     rec.probability = prob;
                     await saveBattleToDB(rec);
+                    if (rec.replayId) existingIds.add(String(rec.replayId));
                     totalImported++;
+                    srcImported++;
                 }
             }
 
@@ -879,7 +837,7 @@ async function runArenaBattle() {
         let bannerSource = 'team_getBanners.arena';
         if (!arenaBannerId) { arenaBannerId = pickBestBannerId(); bannerSource = 'auto.pickBest'; }
         const banners = arenaBannerId ? [arenaBannerId] : [];
-        console.log(LOG, `баннер: ${arenaBannerId} (${bannerSource})`);
+        console.log(LOG, `флаг: ${arenaBannerId} (${bannerSource})`);
 
         if (!heroes.length) throw new Error('Нет пачки для Арены');
 
@@ -924,7 +882,7 @@ async function runArenaBattle() {
             probability = await calcProbability(battle, SIM_COUNT);
             console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
         }
-        if (probability === null || probability >= MIN_PROBABILITY_TO_SAVE) {
+        if (probability !== null && probability >= MIN_PROBABILITY_TO_SAVE) {
             await saveBattleToDB({
                 ts: Date.now(),
                 attackerPack: heroes.slice().sort((a, b) => a - b),
@@ -937,13 +895,15 @@ async function runArenaBattle() {
                 defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
                 attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
                 source: 'arena',
+                replayId: battle?.id
             });
         } else {
-            console.log(LOG, `Арена: бой не сохранён — probability ${(probability * 100).toFixed(0)}% < ${(MIN_PROBABILITY_TO_SAVE * 100)}%`);
+            const probStr = probability === null ? 'н/д' : `${(probability * 100).toFixed(0)}%`;
+            console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
         }
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
-        try { await importArenaHistoryFromServer(); } catch (e) { console.warn(LOG, e); }
+        try { await importArenaHistoryFromServer(1); } catch (e) { console.warn(LOG, e); }
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (Арена):', e);
@@ -1038,12 +998,51 @@ function ensureSquareButtonStyle() {
     `;
     document.head.appendChild(st);
 }
+function ensureFriendBtnStyle() {
+        if (!document.getElementById('hwh-arena-friend-btns')) {
+        const st = document.createElement('style');
+        st.id = 'hwh-arena-friend-btns';
+        st.textContent = `
+        /* Сокет и ряд растягиваем на всю ширину, но с внутренними отступами */
+        .PopUp_blocks > .PopUp_btnSocket:has(.arenaFriendBtn) {
+            align-self: stretch;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 4px 6px 6px 6px;
+        }
+        .PopUp_blocks > .PopUp_btnSocket > .PopUp_btnRow {
+            width: 100%;
+            box-sizing: border-box;
+            gap: 4px;               /* отступ между кнопками */
+        }
+
+        /* Кнопки одинаковой ширины, ничего не вылезает */
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn {
+            flex: 1 1 0;
+            min-width: 0;
+            box-sizing: border-box;
+            padding-left: 0;
+            padding-right: 0;
+        }
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate {
+            width: 100%;
+            min-width: 0;
+            box-sizing: border-box;
+            padding-left: 4px;
+            padding-right: 4px;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+    `;
+        document.head.appendChild(st);
+    }
+}
 function installActionButtons() {
     const arr = HWHData.actionsPopupButtons;
     if (!arr) return false;
     ensureSquareButtonStyle();
     for (let i = arr.length - 1; i >= 0; i--) {
-        if (arr[i] && (arr[i].__arena || arr[i].__grandArena || arr[i].__arenaSettings || arr[i].__friendlyClans)) {
+        if (arr[i] && (arr[i].__arena || arr[i].__grandArena || arr[i].__arenaSettings || arr[i].__friendlyClans || arr[i].__arenaHistory)) {
             arr.splice(i, 1);
         }
     }
@@ -1100,6 +1099,7 @@ function patchDoYourBest() {
             const grandItem = { name: 'oneGrandArenaBattle', label: 'Провести 1 бой на Гранд-Арене', checked: false };
             if (idx >= 0) this.funcList.splice(idx + 1, 0, arenaItem, grandItem);
             else this.funcList.push(arenaItem, grandItem);
+            if (!this.functions) this.functions = {};
             this.functions.oneArenaBattle = runArenaBattle;
             this.functions.oneGrandArenaBattle = runGrandArenaBattle;
         }
