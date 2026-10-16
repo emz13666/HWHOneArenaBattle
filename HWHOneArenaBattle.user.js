@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.2
+// @version      4.3
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -20,6 +20,7 @@
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
 
+
 (async function () {
 'use strict';
 
@@ -32,7 +33,7 @@ const DB_STORE = 'battles';
 const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
 const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
 const SIM_COUNT = 20;
-
+const HISTORY_PAGE_LIMIT = 20;
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
     grandArena: { battle: 21, cooldown: 20, maxTries: 5, label: 'Гранд-Арена' },
@@ -167,14 +168,31 @@ async function openFriendlyClansDialog() {
         label: `${clans[id]} (id ${id})`,
         checked: friends.includes(id),
     }));
+if (!document.getElementById('hwh-arena-friend-btns')) {
+    const st = document.createElement('style');
+    st.id = 'hwh-arena-friend-btns';
+    st.textContent = `
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn {
+            flex: 0 0 auto;
+        }
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate {
+            min-width: 0;
+            padding-left: 10px;
+            padding-right: 10px;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+    `;
+    document.head.appendChild(st);
+}
     const result = await HWHFuncs.popup.confirm(
         `Дружественные гильдии (${ids.length})`,
-        [
-            { msg: 'Сохранить', result: true, color: 'green' },
-            { msg: 'Обновить список', result: 'refresh', color: 'orange' },
-            { msg: 'Отмена', result: false, isCancel: true, color: 'red' },
-        ],
-        checkboxes
+      [
+    { msg: 'OK',        result: true,      color: 'green',  classes: ['arenaFriendBtn'], isOneSocket: true },
+    { msg: 'Обновить',  result: 'refresh', color: 'orange', classes: ['arenaFriendBtn'] },
+    { msg: 'Отмена',    result: false,     color: 'red',    isCancel: true, classes: ['arenaFriendBtn'] },
+],
+      checkboxes
     );
     if (result === 'refresh') {
         await getAllClansCached(true);
@@ -409,16 +427,304 @@ async function saveBattleToDB(record) {
         console.warn(LOG, 'не удалось сохранить бой:', e);
     }
 }
+/* ================================================================= */
+/* === ИМПОРТ ИСТОРИИ АРЕНЫ ИЗ battleGetByType (v4.3)              === */
+/* ================================================================= */
+
+async function isBattleSavedByReplayId(replayId) {
+    if (!replayId) return false;
+    try {
+        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+        await myDb.open();
+        const all = await dbGetAll(myDb);
+        return all.some(r => String(r.replayId) === String(replayId));
+    } catch (e) {
+        return false;
+    }
+}
+
+function extractPackFromTeam(teamObj) {
+    const ids = Object.values(teamObj || {})
+        .map(u => u && u.id)
+        .filter(Boolean);
+    const heroes = ids.filter(id => id < 6000).sort((a, b) => a - b);
+    const pet = ids.find(id => id >= 6000) || null;
+    return { heroes, pet };
+}
+
+function convertReplayToRecords(replay, myUserId, source) {
+    // battleGetByType: userId — владелец записи (я, если я атакующий);
+    // typeId — противник. Моя атака = userId === myId.
+    if (String(replay.userId) !== String(myUserId)) return null;
+
+    const ts = (+replay.startTime || Math.floor(Date.now() / 1000)) * 1000;
+    const replayId = replay.id;
+    const base = {
+        ts,
+        replayId,
+        source,
+        defenderName: '',
+        defenderClanId: null,
+        attackerClanId: null,
+    };
+
+    if (source === 'arena') {
+        const attackers = replay.attackers || {};
+        const defenders = Array.isArray(replay.defenders) ? replay.defenders[0] : (replay.defenders || {});
+        const atk = extractPackFromTeam(attackers);
+        const def = extractPackFromTeam(defenders);
+        if (!atk.heroes.length) return null;
+        return [{
+            ...base,
+            attackerPack: atk.heroes,
+            attackerPet: atk.pet,
+            defenderPack: def.heroes,
+            defenderPet: def.pet,
+            win: !!replay.result?.win,
+            probability: null,
+        }];
+    }
+
+    return null;
+}
+
+async function calcProbabilityForReplay(replay) {
+    try {
+        const battle = structuredClone(replay);
+        if (!battle.progress || !battle.progress.length) {
+            battle.progress = [{ attackers: { input: ['auto', 0, 0, 'auto', 0, 0] } }];
+        }
+        if (!battle.type) battle.type = 'arena';
+        return await calcProbability(battle, SIM_COUNT);
+    } catch (e) {
+        console.warn(LOG, 'calcProbabilityForReplay ошибка:', e.message);
+        return null;
+    }
+}
+
+async function importArenaHistoryFromServer() {
+    const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
+    if (!myUserId) {
+        console.log(LOG, 'импорт истории: нет userInfo.id');
+        HWHFuncs.setProgress('История: нет userInfo.id', 4000);
+        return 0;
+    }
+
+    const LIMIT = 20; // сервер не принимает > 20
+    let totalImported = 0;
+    let totalDuplicates = 0;
+    let totalForeign = 0;
+
+    console.log(LOG, `=== Импорт истории Арены (myUserId=${myUserId}) ===`);
+    HWHFuncs.setProgress('История Арены: загрузка...', false);
+
+    for (const source of ['arena']) {
+        const type = source === 'arena' ? 'arena' : 'grand';
+        let offset = 0;
+        let page = 0;
+        let srcImported = 0;
+
+        console.log(LOG, `--- источник: ${source} (type=${type}) ---`);
+
+        while (true) {
+            page++;
+            let resp;
+            try {
+                resp = await Caller.send({
+                    name: 'battleGetByType',
+                    args: { type, limit: LIMIT, offset },
+                });
+            } catch (e) {
+                const msg = String(e?.message || e);
+                console.warn(LOG, `battleGetByType(${type}) стр.${page} ошибка:`, msg);
+                HWHFuncs.setProgress(`История ${source}: ошибка — ${msg}`, 5000);
+                break;
+            }
+
+            const replays = resp?.replays || [];
+            console.log(LOG, `${source} стр.${page}: получено ${replays.length} реплеев (offset=${offset})`);
+
+            if (!replays.length) {
+                console.log(LOG, `${source}: пустая страница — конец истории`);
+                break;
+            }
+
+            for (const replay of replays) {
+                const records = convertReplayToRecords(replay, myUserId, source);
+                if (!records) {
+                    totalForeign++;
+                    continue;
+                }
+                if (await isBattleSavedByReplayId(replay.id)) {
+                    totalDuplicates++;
+                    continue;
+                }
+
+                const prob = await calcProbabilityForReplay(replay);
+
+                for (const rec of records) {
+                    rec.probability = prob;
+                    await saveBattleToDB(rec);
+                    totalImported++;
+                    srcImported++;
+                }
+            }
+
+            HWHFuncs.setProgress(
+                `История ${source}: стр.${page}, новых ${srcImported}, дублей ${totalDuplicates}`,
+                false
+            );
+
+            if (replays.length < LIMIT) {
+                console.log(LOG, `${source}: последняя страница (получено ${replays.length} < ${LIMIT})`);
+                break;
+            }
+            offset += LIMIT;
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        console.log(LOG, `${source}: итог — сохранено ${srcImported}`);
+    }
+
+    const summary = `История: +${totalImported} новых (дублей ${totalDuplicates}, не моих ${totalForeign})`;
+    console.log(LOG, summary);
+    HWHFuncs.setProgress(summary, 6000);
+    return totalImported;
+}
+/* === Экспорт / Импорт IndexedDB в файл === */
+
+async function exportArenaDB() {
+    try {
+        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+        await myDb.open();
+        const all = await dbGetAll(myDb);
+        if (!all.length) {
+            HWHFuncs.setProgress('БД пуста', 3000);
+            return;
+        }
+        const payload = {
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            scriptVersion: GM_info.script.version,
+            records: all,
+        };
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `hwh_arena_backup_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        console.log(LOG, `экспорт: ${all.length} записей`);
+        HWHFuncs.setProgress(`Экспорт: ${all.length} записей`, 3000);
+    } catch (e) {
+        console.error(LOG, 'экспорт ошибка:', e);
+        HWHFuncs.setProgress('Экспорт: ошибка', 3000);
+    }
+}
+
+async function importArenaDB() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.style.display = 'none';
+    input.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        input.remove();
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            const records = data?.records;
+            if (!Array.isArray(records)) throw new Error('Нет поля "records"');
+
+            const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+            await myDb.open();
+            const existing = await dbGetAll(myDb);
+            const existingIds = new Set(existing.map(r => String(r.replayId)).filter(Boolean));
+
+            let added = 0, skipped = 0;
+            for (const rec of records) {
+                if (rec.replayId && existingIds.has(String(rec.replayId))) {
+                    skipped++;
+                    continue;
+                }
+                const key = 'b_' + (rec.ts || Date.now()) + '_' + Math.random().toString(36).slice(2, 8);
+                await myDb.set(key, rec);
+                if (rec.replayId) existingIds.add(String(rec.replayId));
+                added++;
+            }
+            console.log(LOG, `импорт БД: +${added}, пропущено ${skipped}`);
+            HWHFuncs.setProgress(`Импорт БД: +${added} (пропущено ${skipped})`, 4000);
+        } catch (err) {
+            console.error(LOG, 'импорт БД ошибка:', err);
+            HWHFuncs.setProgress('Импорт БД: ошибка — ' + err.message, 4000);
+        }
+    });
+    document.body.appendChild(input);
+    input.click();
+}
+
+async function openHistoryDialog() {
+    const result = await HWHFuncs.popup.confirm(
+        'История Арены (IndexedDB)',
+        [
+            { msg: '💾 Экспорт', result: 'export', color: 'green' },
+            { msg: '📂 Импорт', result: 'import', color: 'blue' },
+            { msg: '🔄 Загрузить с сервера', result: 'server', color: 'orange' },
+            { msg: 'Отмена', result: false, isCancel: true, color: 'red' },
+        ]
+    );
+    if (result === 'export') await exportArenaDB();
+    else if (result === 'import') await importArenaDB();
+    else if (result === 'server') await importArenaHistoryFromServer();
+}
+/**
+ * Насколько похожи две пачки героев.
+ * Возвращает долю совпадающих героев от размера большей пачки.
+ * 1.0 — полное совпадение, 0.0 — ничего общего.
+ */
+function packSimilarity(a, b) {
+    if (!a?.length || !b?.length) return 0;
+    const setB = new Set(b);
+    const overlap = a.filter(x => setB.has(x)).length;
+    return overlap / Math.max(a.length, b.length);
+}
 async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
     if (!HWHClasses.Database) return [];
     try {
         const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
         await myDb.open();
         const all = await dbGetAll(myDb);
+
         const targetKey = packKey(defenderHeroes, defenderPet);
+
+        // === 1) Точный матч по пачке защитника ===
+        const exact = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey);
+
+        // === 2) Фолбэк — нечёткий матч (>= 80% совпадения героев, пет не мешает) ===
+        let fuzzy = [];
+        if (!exact.length) {
+            fuzzy = all.filter(r => {
+                const sim = packSimilarity(r.defenderPack || [], defenderHeroes || []);
+                if (sim < 0.8) return false;
+                // Если у обоих есть пет — он должен совпадать, иначе пропускаем
+                if (defenderPet && r.defenderPet && defenderPet !== r.defenderPet) return false;
+                return true;
+            });
+            if (fuzzy.length) {
+                console.log(LOG, `точного матча нет — фолбэк на похожих защит (${fuzzy.length} записей)`);
+            }
+        }
+
+        const source = exact.length ? exact : fuzzy;
+        if (!source.length) return [];
+
+        // === 3) Группируем по моей пачке и считаем simProbability ===
         const byAttacker = new Map();
-        for (const r of all) {
-            if (packKey(r.defenderPack, r.defenderPet) !== targetKey) continue;
+        for (const r of source) {
             const akey = packKey(r.attackerPack, r.attackerPet);
             if (!byAttacker.has(akey)) {
                 byAttacker.set(akey, {
@@ -428,6 +734,8 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
                     total: 0,
                     simSum: 0,
                     simCount: 0,
+                    matched: 0,        // сколько записей попало в эту группу
+                    exact: 0,          // сколько из них — точный матч по защите
                 });
             }
             const e = byAttacker.get(akey);
@@ -437,14 +745,17 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
                 e.simSum += r.probability;
                 e.simCount++;
             }
+            e.matched++;
+            if (exact.includes(r)) e.exact++;
         }
+
         return [...byAttacker.values()]
             .map(e => ({
                 ...e,
                 histWinRate: e.total > 0 ? e.wins / e.total : 0,
                 simProbability: e.simCount > 0 ? e.simSum / e.simCount : null,
             }))
-            .filter(e => e.simProbability !== null)
+            .filter(e => e.simProbability !== null && e.attackerPack?.length === 5)
             .sort((a, b) => b.simProbability - a.simProbability)
             .slice(0, topN);
     } catch (e) {
@@ -452,7 +763,6 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
         return [];
     }
 }
-
 /* ===== ПОИСК СОПЕРНИКОВ ===== */
 async function pickArenaEnemy(myClanId, noAttackFriendly, maxAttempts = 10, delayMs = 1500) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -499,11 +809,20 @@ async function pickGrandEnemy(myClanId, noAttackFriendly, maxAttempts = 10, dela
 async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackPet) {
     try {
         const alts = await findBestAttackerPacks(defHeroes, defPet, 5);
-        if (!alts.length) return null;
+        if (!alts.length) {
+            console.log(LOG, 'лучших пачек в БД не найдено — использую сохранённую пачку');
+            return null;
+        }
         const best = alts[0];
         console.log(LOG, `лучшие пачки (по simProbability):`);
         for (const a of alts) {
-            console.log(`   [${a.attackerPack.join(',')}] пет ${a.attackerPet || '-'} → сим ${(a.simProbability*100).toFixed(0)}%, факт ${a.wins}/${a.total} (${(a.histWinRate*100).toFixed(0)}%)`);
+            const marker = a.exact > 0 ? '[точных]' : '[фолбэк]';
+            console.log(
+                `   ${marker} [${a.attackerPack.join(',')}] пет ${a.attackerPet || '-'} → ` +
+                `сим ${(a.simProbability * 100).toFixed(0)}%, ` +
+                `факт ${a.wins}/${a.total} (${(a.histWinRate * 100).toFixed(0)}%), ` +
+                `матчей: ${a.matched}`
+            );
         }
         if (best.attackerPack.length !== 5) return null;
         return best;
@@ -592,6 +911,7 @@ async function runArenaBattle() {
 
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
+        try { await importArenaHistoryFromServer(); } catch (e) { console.warn(LOG, e); }
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (Арена):', e);
@@ -639,37 +959,6 @@ async function runGrandArenaBattle() {
         let result;
         try { result = await Caller.send({ name: 'grandAttack', args }); }
         catch (e) { if (handleRefillError(e, 'grandArena')) return false; throw e; }
-
-        // Сохраняем каждый бой отдельно + считаем probability для каждого
-        const battles = result?.battles || [];
-        for (let i = 0; i < battles.length; i++) {
-            const b = battles[i];
-            const r = b?.result;
-            const atkHeroes = heroesArr[i] || [];
-            const atkPet    = petsArr[i] || null;
-            const defTeam   = enemy.heroes?.[i] || [];
-            const defHeroes = defTeam.filter(h => h.id < 6000).map(h => h.id);
-            const defPet    = defTeam.find(h => h.id >= 6000)?.id || null;
-
-            HWHFuncs.setProgress(`ГА: расчёт вероятности ${i + 1}/${battles.length}...`, false);
-            const probability = await calcProbability(b, SIM_COUNT);
-            console.log(LOG, `ГА бой ${i + 1}: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
-
-            await saveBattleToDB({
-                ts: Date.now() + i,
-                attackerPack: atkHeroes.slice().sort((a, b) => a - b),
-                attackerPet: atkPet,
-                defenderPack: defHeroes.slice().sort((a, b) => a - b),
-                defenderPet: defPet,
-                win: !!r?.win,
-                probability,
-                defenderName: enemy.user?.name || '',
-                defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
-                attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
-                source: 'grandArena',
-                battleOrder: r?.battleOrder ?? i,
-            });
-        }
 
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Гранд-Арена', 'grandArena');
@@ -749,6 +1038,14 @@ function installActionButtons() {
         color: 'green',
         classes: ['fixedSquare'],
     });
+     arr.push({
+        __arenaHistory: true,
+        get msg() { return '📚'; },
+        get title() { return 'История Арены: экспорт / импорт / загрузка с сервера'; },
+        result() { openHistoryDialog(); },
+        color: 'blue',
+        classes: ['fixedSquare'],
+    });
     arr.push({
         __grandArena: true,
         get msg() { return 'Провести 1 бой на Гранд-Арене'; },
@@ -756,7 +1053,8 @@ function installActionButtons() {
         result() { runGrandArenaBattle(); },
         color: 'violet',
     });
-    console.log(LOG, 'кнопки добавлены: Арена, ⚙️, 🌐, Гранд-Арена');
+
+    console.log(LOG, 'кнопки добавлены: Арена, ⚙️, 🌐, 📚, Гранд-Арена');
     return true;
 }
 function patchDoYourBest() {
