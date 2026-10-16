@@ -2,9 +2,9 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.0
-// @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Arena banner: from UI or auto-pick.
-// @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Арена: баннер из UI или авто-подбор.
+// @version      4.2
+// @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
+// @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
 // @license      MIT
 // @homepage     https://github.com/emz13666/HWHOneArenaBattle
@@ -27,6 +27,11 @@ const LOG = '[HWHOneArenaBattle]';
 const SETTINGS_KEY = 'HWHOneArenaBattle.settings';
 const FRIENDLY_CLANS_KEY = 'HWHOneArenaBattle.friendlyClans';
 const CLAN_LIST_CACHE_KEY = 'HWHOneArenaBattle.clanListCache';
+const DB_NAME = 'HWHOneArenaBattle';
+const DB_STORE = 'battles';
+const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
+const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
+const SIM_COUNT = 20;
 
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
@@ -34,15 +39,12 @@ const REFILL = {
 };
 
 const COLOR_PRIORITY = {
-    red: 0,
-    orange: 1, yellow: 1, gold: 1,
-    purple: 2, violet: 2,
-    blue: 3,
-    green: 4,
+    red: 0, orange: 1, yellow: 1, gold: 1,
+    purple: 2, violet: 2, blue: 3, green: 4,
     grey: 5, gray: 5, white: 5,
 };
-function colorRank(color) {
-    const c = String(color || '').toLowerCase();
+function colorRank(c) {
+    c = String(c || '').toLowerCase();
     return c in COLOR_PRIORITY ? COLOR_PRIORITY[c] : 6;
 }
 
@@ -72,6 +74,7 @@ const defaultSettings = {
     onlyIfNoAttacksTodayArena: false,
     onlyIfNoAttacksTodayGrand: false,
     noAttackFriendlyClans: true,
+    useBestPackFromHistory: true,
 };
 
 function loadSettings() {
@@ -90,14 +93,13 @@ function saveFriendlyClans(arr) {
     try { localStorage.setItem(FRIENDLY_CLANS_KEY, JSON.stringify(arr)); } catch (e) {}
 }
 
-/* ===== СПИСОК ГИЛЬДИЙ (для выбора дружественных) ===== */
+/* ===== СПИСОК ГИЛЬДИЙ ===== */
 async function fetchAllClansFromServer() {
     const result = {};
     for (const league of [1, 2, 3, 4]) {
         try {
             const r = await Caller.send({ name: 'clanWarGetLeagueTop', args: { league, current: true } });
-            const clans = r?.clans || [];
-            for (const c of clans) {
+            for (const c of (r?.clans || [])) {
                 if (c?.id && c?.title) result[String(c.id)] = c.title;
             }
         } catch (e) {
@@ -107,15 +109,11 @@ async function fetchAllClansFromServer() {
     console.log(LOG, `получено гильдий: ${Object.keys(result).length}`);
     return result;
 }
-
 async function getAllClansCached(forceRefresh = false) {
     if (!forceRefresh) {
         try {
             const c = JSON.parse(localStorage.getItem(CLAN_LIST_CACHE_KEY) || 'null');
-            if (c && c.ts && Date.now() - c.ts < 24 * 3600 * 1000 && c.data) {
-                console.log(LOG, 'список гильдий: из кэша (24ч)');
-                return c.data;
-            }
+            if (c && c.ts && Date.now() - c.ts < 24 * 3600 * 1000 && c.data) return c.data;
         } catch (e) {}
     }
     const data = await fetchAllClansFromServer();
@@ -123,7 +121,7 @@ async function getAllClansCached(forceRefresh = false) {
     return data;
 }
 
-/* ===== ДИАЛОГ 1: базовые настройки ===== */
+/* ===== ДИАЛОГ: базовые настройки ===== */
 async function openSettingsDialog() {
     const s = loadSettings();
     const result = await HWHFuncs.popup.confirm(
@@ -136,6 +134,7 @@ async function openSettingsDialog() {
             { name: 'onlyIfNoAttacksTodayArena', label: 'Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayArena },
             { name: 'onlyIfNoAttacksTodayGrand', label: 'Гранд-Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayGrand },
             { name: 'noAttackFriendlyClans', label: 'Не атаковать дружественные гильдии', checked: s.noAttackFriendlyClans },
+            { name: 'useBestPackFromHistory', label: 'Использовать лучшую пачку из истории (по simProbability)', checked: s.useBestPackFromHistory },
         ]
     );
     if (!result) { console.log(LOG, 'настройки: отмена'); return; }
@@ -147,33 +146,27 @@ async function openSettingsDialog() {
     HWHFuncs.setProgress('Настройки сохранены', 3000);
 }
 
-/* ===== ДИАЛОГ 2: дружественные гильдии ===== */
+/* ===== ДИАЛОГ: дружественные гильдии ===== */
 async function openFriendlyClansDialog() {
     HWHFuncs.setProgress('Загрузка списка гильдий...');
-    const clans = await getAllClansCached();       // { id: title }
+    const clans = await getAllClansCached();
     const friends = loadFriendlyClans();
-
-    // Свою гильдию исключаем
     const myClanId = String(HWHFuncs.getUserInfo()?.clanId || '');
     const ids = Object.keys(clans).filter(id => id !== myClanId);
     if (!ids.length) {
         HWHFuncs.popup.confirm('Не удалось получить список гильдий.<br>Попробуйте позже.', [{ msg: 'OK', result: 0, color: 'green' }]);
         return;
     }
-
-    // Сортируем: сначала уже дружественные, потом остальные (по названию)
     ids.sort((a, b) => {
         const aF = friends.includes(a), bF = friends.includes(b);
         if (aF !== bF) return bF - aF;
         return clans[a].localeCompare(clans[b]);
     });
-
     const checkboxes = ids.map(id => ({
         name: 'clan_' + id,
         label: `${clans[id]} (id ${id})`,
         checked: friends.includes(id),
     }));
-
     const result = await HWHFuncs.popup.confirm(
         `Дружественные гильдии (${ids.length})`,
         [
@@ -183,21 +176,14 @@ async function openFriendlyClansDialog() {
         ],
         checkboxes
     );
-
     if (result === 'refresh') {
         await getAllClansCached(true);
         HWHFuncs.setProgress('Список гильдий обновлён', 3000);
-        return openFriendlyClansDialog();   // перезапуск
+        return openFriendlyClansDialog();
     }
     if (!result) { console.log(LOG, 'дружественные: отмена'); return; }
-
     const boxes = HWHFuncs.popup.getCheckBoxes();
-    const newFriends = [];
-    for (const b of boxes) {
-        if (b.name.startsWith('clan_') && b.checked) {
-            newFriends.push(b.name.replace('clan_', ''));
-        }
-    }
+    const newFriends = boxes.filter(b => b.name.startsWith('clan_') && b.checked).map(b => b.name.replace('clan_', ''));
     saveFriendlyClans(newFriends);
     console.log(LOG, `дружественных гильдий сохранено: ${newFriends.length}`);
     HWHFuncs.setProgress(`Дружественных: ${newFriends.length}`, 3000);
@@ -206,9 +192,9 @@ async function openFriendlyClansDialog() {
 /* ===== ФИЛЬТР СОПЕРНИКОВ ===== */
 function isEnemyAllowed(enemy, myClanId, noAttackFriendly) {
     const cid = enemy?.user?.clanId ? String(enemy.user.clanId) : '';
-    if (!cid) return true;                              // без клана — атакуем
-    if (cid === String(myClanId)) return false;         // своя гильдия — не атакуем
-    if (noAttackFriendly && loadFriendlyClans().includes(cid)) return false; // дружественная
+    if (!cid) return true;
+    if (cid === String(myClanId)) return false;
+    if (noAttackFriendly && loadFriendlyClans().includes(cid)) return false;
     return true;
 }
 
@@ -221,11 +207,9 @@ function getBannersFromGame() {
         const player = Game.GameModel[fnP(Game.GameModel, 'get_instance')]()[protoFn(Game.GameModel, 0)];
         const pbd = findInstanceOf(player, g['game.model.user.banner.PlayerBannerData']);
         if (!pbd) return [];
-
         const OeD  = pbd?.mj?.Oe?.D;
         const xudD = pbd?.xud?.D;
         if (!OeD) return [];
-
         const list = [];
         for (const key of Object.keys(OeD)) {
             if (key === 'TC') continue;
@@ -235,8 +219,7 @@ function getBannersFromGame() {
             const name = meta.Me.Ci || ('bank#' + id);
             const slots = xudD?.[id]?.$e?.D;
             const slotKeys = slots ? Object.keys(slots) : [];
-            const slotsCount = slotKeys.length;
-            const colorCounts = [0, 0, 0, 0, 0, 0];
+            const colorCounts = [0,0,0,0,0,0];
             const colorNames = [];
             for (const sk of slotKeys) {
                 const c = slots[sk]?.Yi?.oo || 'grey';
@@ -244,7 +227,7 @@ function getBannersFromGame() {
                 if (rank < 6) colorCounts[rank]++;
                 colorNames.push(c);
             }
-            list.push({ id, name, slotsCount, colorCounts, colorNames });
+            list.push({ id, name, slotsCount: slotKeys.length, colorCounts, colorNames });
         }
         return list;
     } catch (e) {
@@ -252,25 +235,16 @@ function getBannersFromGame() {
         return [];
     }
 }
-
 function pickBestBannerId() {
     const list = getBannersFromGame();
     if (!list.length) return null;
-
     const sorted = [...list].sort((a, b) => {
-        for (let i = 0; i < 6; i++) {
-            if (a.colorCounts[i] !== b.colorCounts[i]) return b.colorCounts[i] - a.colorCounts[i];
-        }
+        for (let i = 0; i < 6; i++) if (a.colorCounts[i] !== b.colorCounts[i]) return b.colorCounts[i] - a.colorCounts[i];
         if (a.slotsCount !== b.slotsCount) return b.slotsCount - a.slotsCount;
         return a.id - b.id;
     });
-
     const top = sorted[0];
-    const equals = sorted.filter(b =>
-        b.slotsCount === top.slotsCount &&
-        b.colorCounts.every((v, i) => v === top.colorCounts[i])
-    );
-
+    const equals = sorted.filter(b => b.slotsCount === top.slotsCount && b.colorCounts.every((v, i) => v === top.colorCounts[i]));
     const picked = equals[Math.floor(Math.random() * equals.length)];
     console.log(LOG, `равнозначных: ${equals.length} [${equals.map(b => b.id).join(', ')}], выбран: ${picked.id}`);
     return picked.id;
@@ -290,11 +264,10 @@ function hadAttacksToday(userGetInfo, kind) {
     return tries < REFILL[kind].maxTries;
 }
 
-/* ===== ОБРАБОТКА ОШИБОК ===== */
+/* ===== ОШИБКИ ===== */
 function handleRefillError(e, kind) {
     const msg = String(e?.message || e);
     const ref = REFILL[kind];
-
     const m = msg.match(/Refillable (\d+).*delta (\d+)/);
     if (m) {
         const [, refillId, delta] = m;
@@ -305,19 +278,18 @@ function handleRefillError(e, kind) {
         HWHFuncs.setProgress(`${label}: подожди ${delta} сек`, 5000);
         return true;
     }
-
     if (msg.includes('NotEnough') && msg.includes('Refillable ' + ref.battle)) {
-        console.log(LOG, `${ref.label}: сервер отказал, нет попыток`);
+        console.log(LOG, `${ref.label}: нет попыток`);
         HWHFuncs.setProgress(`${ref.label}: нет попыток`, 5000);
         return true;
     }
     return false;
 }
 
+/* ===== РЕЗУЛЬТАТ ===== */
 function reportBattleResult(result, label, kind) {
     const isGrand = kind === 'grandArena';
     const battles = result?.battles || [];
-
     const appliedBanners = battles.map(b => b?.effects?.attackersBanner?.id).filter(Boolean);
     if (appliedBanners.length) console.log(LOG, `сервер применил баннеры: [${appliedBanners.join(', ')}]`);
 
@@ -329,16 +301,15 @@ function reportBattleResult(result, label, kind) {
         let oldPlace = null, newPlace = null;
         for (const b of battles) {
             const r = b?.result;
-            if (r && r.oldPlace && r.newPlace) { oldPlace = r.oldPlace; newPlace = r.newPlace; break; }
+            if (r?.oldPlace && r?.newPlace) { oldPlace = r.oldPlace; newPlace = r.newPlace; break; }
         }
-        const grandPlaceNow = result?.state?.grandPlace;
+        const gp = result?.state?.grandPlace;
         const score = `${wins}/${total}`;
-        const placeInfo = (oldPlace && newPlace) ? `${oldPlace} → ${newPlace}`
-                        : grandPlaceNow ? `место: ${grandPlaceNow}` : '';
+        const placeInfo = (oldPlace && newPlace) ? `${oldPlace} → ${newPlace}` : (gp ? `место: ${gp}` : '');
         console.log(LOG, `Гранд-Арена: счёт ${score}${placeInfo ? `, ${placeInfo}` : ''}`);
         console.log(LOG, 'по боям:', battles.map(b => ({ order: b?.result?.battleOrder, win: b?.result?.win, stars: b?.result?.stars })));
         if (winFinal) {
-            console.log(LOG, `Гранд-Арена ПОБЕДА ${score}${placeInfo ? ` (${placeInfo})` : ''}`);
+            console.log(LOG, `Гранд-Арена ПОБЕДА ${score}`);
             HWHFuncs.setProgress(`Гранд-Арена: ПОБЕДА ${score}`, 5000);
         } else {
             console.log(LOG, `Гранд-Арена ПОРАЖЕНИЕ ${score}`);
@@ -359,6 +330,126 @@ function reportBattleResult(result, label, kind) {
     } else {
         console.log(LOG, 'Арена: результат не получен');
         HWHFuncs.setProgress('Арена: бой завершён', 5000);
+    }
+}
+
+/* ===== СИМУЛЯЦИЯ ВЕРОЯТНОСТИ ===== */
+async function calcProbability(battle, N = SIM_COUNT) {
+    if (!battle || typeof Calc !== 'function') return null;
+    let wins = 0, total = 0;
+    for (let i = 0; i < N; i++) {
+        try {
+            const sim = structuredClone(battle);
+            sim.seed = Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 1e6);
+            sim.progress = [{ attackers: { input: ['auto', 0, 0, 'auto', 0, 0] } }];
+            const r = await Calc(sim);
+            total++;
+            if (r?.result?.win) wins++;
+        } catch (e) {
+            console.warn(LOG, `симуляция ${i + 1}/${N} упала:`, e.message);
+        }
+        await new Promise(r => setTimeout(r, 20));
+    }
+    if (total === 0) return null;
+    return wins / total;
+}
+
+/* ===== INDEXEDDB: сохранение и поиск ===== */
+function packKey(heroes, pet) {
+    const sorted = (heroes || []).slice().sort((a, b) => a - b);
+    return sorted.join(',') + '|' + (pet || '');
+}
+async function dbGetAll(myDb) {
+    return new Promise((resolve) => {
+        const tx = myDb.db.transaction([DB_STORE], 'readonly');
+        const store = tx.objectStore(DB_STORE);
+        const req = store.getAll();
+        req.onerror = () => resolve([]);
+        req.onsuccess = () => resolve(req.result || []);
+    });
+}
+async function dbGetAllKeys(myDb) {
+    return new Promise((resolve) => {
+        const tx = myDb.db.transaction([DB_STORE], 'readonly');
+        const store = tx.objectStore(DB_STORE);
+        const req = store.getAllKeys();
+        req.onerror = () => resolve([]);
+        req.onsuccess = () => resolve(req.result || []);
+    });
+}
+async function pruneOldBattlesIfNeeded() {
+    try {
+        const last = parseInt(localStorage.getItem(PRUNE_KEY) || '0');
+        if (Date.now() - last < 24 * 3600 * 1000) return;
+        if (!HWHClasses.Database) return;
+        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+        await myDb.open();
+        const keys = await dbGetAllKeys(myDb);
+        const now = Date.now();
+        let removed = 0;
+        for (const key of keys) {
+            const ts = parseInt(String(key).split('_')[1]);
+            if (!ts || now - ts > MAX_AGE_MS) { await myDb.delete(key); removed++; }
+        }
+        localStorage.setItem(PRUNE_KEY, String(now));
+        if (removed) console.log(LOG, `прунинг БД: удалено ${removed} записей (старше 120 дн.)`);
+    } catch (e) {
+        console.warn(LOG, 'ошибка прунинга:', e);
+    }
+}
+async function saveBattleToDB(record) {
+    if (!HWHClasses.Database) return;
+    try {
+        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+        await myDb.open();
+        const key = 'b_' + record.ts + '_' + Math.random().toString(36).slice(2, 8);
+        await myDb.set(key, record);
+        console.log(LOG, 'бой сохранён:', key);
+    } catch (e) {
+        console.warn(LOG, 'не удалось сохранить бой:', e);
+    }
+}
+async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
+    if (!HWHClasses.Database) return [];
+    try {
+        const myDb = new HWHClasses.Database(DB_NAME, DB_STORE);
+        await myDb.open();
+        const all = await dbGetAll(myDb);
+        const targetKey = packKey(defenderHeroes, defenderPet);
+        const byAttacker = new Map();
+        for (const r of all) {
+            if (packKey(r.defenderPack, r.defenderPet) !== targetKey) continue;
+            const akey = packKey(r.attackerPack, r.attackerPet);
+            if (!byAttacker.has(akey)) {
+                byAttacker.set(akey, {
+                    attackerPack: r.attackerPack,
+                    attackerPet: r.attackerPet,
+                    wins: 0,
+                    total: 0,
+                    simSum: 0,
+                    simCount: 0,
+                });
+            }
+            const e = byAttacker.get(akey);
+            e.total++;
+            if (r.win) e.wins++;
+            if (typeof r.probability === 'number') {
+                e.simSum += r.probability;
+                e.simCount++;
+            }
+        }
+        return [...byAttacker.values()]
+            .map(e => ({
+                ...e,
+                histWinRate: e.total > 0 ? e.wins / e.total : 0,
+                simProbability: e.simCount > 0 ? e.simSum / e.simCount : null,
+            }))
+            .filter(e => e.simProbability !== null)
+            .sort((a, b) => b.simProbability - a.simProbability)
+            .slice(0, topN);
+    } catch (e) {
+        console.warn(LOG, 'ошибка поиска пачек:', e);
+        return [];
     }
 }
 
@@ -383,7 +474,6 @@ async function pickArenaEnemy(myClanId, noAttackFriendly, maxAttempts = 10, dela
     }
     throw new Error('Не удалось найти соперника (Арена)');
 }
-
 async function pickGrandEnemy(myClanId, noAttackFriendly, maxAttempts = 10, delayMs = 1500) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const enemies = await Caller.send('grandFindEnemies');
@@ -405,17 +495,35 @@ async function pickGrandEnemy(myClanId, noAttackFriendly, maxAttempts = 10, dela
     throw new Error('Не удалось найти соперника (ГА)');
 }
 
+/* ===== ВЫБОР ПАЧКИ ПО simProbability ===== */
+async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackPet) {
+    try {
+        const alts = await findBestAttackerPacks(defHeroes, defPet, 5);
+        if (!alts.length) return null;
+        const best = alts[0];
+        console.log(LOG, `лучшие пачки (по simProbability):`);
+        for (const a of alts) {
+            console.log(`   [${a.attackerPack.join(',')}] пет ${a.attackerPet || '-'} → сим ${(a.simProbability*100).toFixed(0)}%, факт ${a.wins}/${a.total} (${(a.histWinRate*100).toFixed(0)}%)`);
+        }
+        if (best.attackerPack.length !== 5) return null;
+        return best;
+    } catch (e) {
+        console.warn(LOG, 'ошибка выбора пачки:', e);
+        return null;
+    }
+}
+
 /* ===== АРЕНА ===== */
 async function runArenaBattle() {
-    console.log(LOG, '=== запуск боя: Арена ===');
+    console.log(LOG, '=== Арена ===');
     HWHFuncs.setProgress('Арена: подготовка...');
     try {
         const [teamGetAll, teamGetFavor, team_getBanners, userGetInfo] = await Caller.send([
             'teamGetAll', 'teamGetFavor', 'team_getBanners', 'userGetInfo',
         ]);
         const arenaTeam = (teamGetAll?.arena) || [];
-        const heroes = arenaTeam.filter(id => id < 6000).slice(0, 5);
-        const pet = arenaTeam.filter(id => id >= 6000).pop() || null;
+        let heroes = arenaTeam.filter(id => id < 6000).slice(0, 5);
+        let pet = arenaTeam.filter(id => id >= 6000).pop() || null;
         const favor = (teamGetFavor?.arena) || {};
 
         const tgb = team_getBanners || {};
@@ -423,22 +531,34 @@ async function runArenaBattle() {
         let bannerSource = 'team_getBanners.arena';
         if (!arenaBannerId) { arenaBannerId = pickBestBannerId(); bannerSource = 'auto.pickBest'; }
         const banners = arenaBannerId ? [arenaBannerId] : [];
-        console.log(LOG, `баннер для арены: ${arenaBannerId} (источник: ${bannerSource})`);
+        console.log(LOG, `баннер: ${arenaBannerId} (${bannerSource})`);
 
-        if (!heroes.length) throw new Error('Не задана пачка для Арены');
+        if (!heroes.length) throw new Error('Нет пачки для Арены');
 
         const settings = loadSettings();
         if (settings.onlyIfNoAttacksTodayArena && hadAttacksToday(userGetInfo, 'arena')) {
-            console.log(LOG, 'Арена: сегодня уже были атаки — пропускаем');
-            HWHFuncs.setProgress('Арена: сегодня уже атаковали', 5000);
+            console.log(LOG, 'Арена: сегодня уже атаковали — пропуск');
+            HWHFuncs.setProgress('Арена: уже атаковали', 5000);
             return false;
         }
-
         const tries = getTries(userGetInfo, 'arena');
         if (tries === 0) { HWHFuncs.setProgress('Арена: нет попыток', 5000); return false; }
 
         const enemy = await pickArenaEnemy(userGetInfo?.clanId, settings.noAttackFriendlyClans);
         console.log(LOG, 'Арена: бой с', enemy.user?.name || enemy.userId);
+
+        const defHeroes = (enemy.heroes || []).filter(h => h.id < 6000).map(h => h.id);
+        const defPet    = (enemy.heroes || []).find(h => h.id >= 6000)?.id || null;
+
+        // Автовыбор лучшей пачки из истории
+        if (settings.useBestPackFromHistory) {
+            const best = await tryUseBestPack('arena', defHeroes, defPet, heroes, pet);
+            if (best) {
+                heroes = best.attackerPack.slice();
+                pet = best.attackerPet;
+                console.log(LOG, `Арена: используем лучшую пачку из БД: [${heroes.join(',')}] пет ${pet || '-'}`);
+            }
+        }
 
         const args = { userId: +enemy.userId, heroes, favor };
         if (pet) args.pet = pet;
@@ -448,6 +568,29 @@ async function runArenaBattle() {
         try { result = await Caller.send({ name: 'arenaAttack', args }); }
         catch (e) { if (handleRefillError(e, 'arena')) return false; throw e; }
 
+        // Probability + сохранение
+        const battle = result?.battles?.[0];
+        let probability = null;
+        if (battle) {
+            HWHFuncs.setProgress('Арена: расчёт вероятности...', false);
+            probability = await calcProbability(battle, SIM_COUNT);
+            console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
+        }
+        await saveBattleToDB({
+            ts: Date.now(),
+            attackerPack: heroes.slice().sort((a, b) => a - b),
+            attackerPet: pet,
+            defenderPack: defHeroes.slice().sort((a, b) => a - b),
+            defenderPet: defPet,
+            win: !!battle?.result?.win,
+            probability,
+            defenderName: enemy.user?.name || '',
+            defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
+            attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
+            source: 'arena',
+        });
+
+        await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
         return true;
     } catch (e) {
@@ -459,46 +602,81 @@ async function runArenaBattle() {
 
 /* ===== ГРАНД-АРЕНА ===== */
 async function runGrandArenaBattle() {
-    console.log(LOG, '=== запуск боя: Гранд-Арена ===');
+    console.log(LOG, '=== Гранд-Арена ===');
     HWHFuncs.setProgress('Гранд-Арена: подготовка...');
     try {
         const [teamGetAll, teamGetFavor, team_getBanners, userGetInfo] = await Caller.send([
             'teamGetAll', 'teamGetFavor', 'team_getBanners', 'userGetInfo',
         ]);
-
         const grandTeams = (teamGetAll?.grand) || [];
-        if (grandTeams.length < 3) throw new Error('Не заданы 3 пачки для Гранд-Арены');
-
-        const heroes = grandTeams.map(t => (t || []).filter(id => id < 6000).slice(0, 5));
-        const pets   = grandTeams.map(t => (t || []).filter(id => id >= 6000).pop() || null);
+        if (grandTeams.length < 3) throw new Error('Нет 3 пачек для ГА');
+        let heroesArr = grandTeams.map(t => (t || []).filter(id => id < 6000).slice(0, 5));
+        let petsArr   = grandTeams.map(t => (t || []).filter(id => id >= 6000).pop() || null);
         const favor  = (teamGetFavor?.grand) || {};
         const raw = (team_getBanners?.grand) || [];
         const banners = [0, 1, 2].map(i => raw[i] || null);
 
         const settings = loadSettings();
         if (settings.onlyIfNoAttacksTodayGrand && hadAttacksToday(userGetInfo, 'grandArena')) {
-            console.log(LOG, 'ГА: сегодня уже были атаки — пропускаем');
-            HWHFuncs.setProgress('Гранд-Арена: сегодня уже атаковали', 5000);
+            console.log(LOG, 'ГА: сегодня уже атаковали — пропуск');
+            HWHFuncs.setProgress('ГА: уже атаковали', 5000);
             return false;
         }
-
         const tries = getTries(userGetInfo, 'grandArena');
-        if (tries === 0) { HWHFuncs.setProgress('Гранд-Арена: нет попыток', 5000); return false; }
+        if (tries === 0) { HWHFuncs.setProgress('ГА: нет попыток', 5000); return false; }
 
         const enemy = await pickGrandEnemy(userGetInfo?.clanId, settings.noAttackFriendlyClans);
         console.log(LOG, 'ГА: бой с', enemy.user?.name || enemy.userId);
 
-        const args = { userId: +enemy.userId, heroes, pets, favor, banners };
+        const args = {
+            userId: +enemy.userId,
+            heroes: heroesArr,
+            pets:   petsArr,
+            favor,
+            banners,
+        };
 
         let result;
         try { result = await Caller.send({ name: 'grandAttack', args }); }
         catch (e) { if (handleRefillError(e, 'grandArena')) return false; throw e; }
 
+        // Сохраняем каждый бой отдельно + считаем probability для каждого
+        const battles = result?.battles || [];
+        for (let i = 0; i < battles.length; i++) {
+            const b = battles[i];
+            const r = b?.result;
+            const atkHeroes = heroesArr[i] || [];
+            const atkPet    = petsArr[i] || null;
+            const defTeam   = enemy.heroes?.[i] || [];
+            const defHeroes = defTeam.filter(h => h.id < 6000).map(h => h.id);
+            const defPet    = defTeam.find(h => h.id >= 6000)?.id || null;
+
+            HWHFuncs.setProgress(`ГА: расчёт вероятности ${i + 1}/${battles.length}...`, false);
+            const probability = await calcProbability(b, SIM_COUNT);
+            console.log(LOG, `ГА бой ${i + 1}: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
+
+            await saveBattleToDB({
+                ts: Date.now() + i,
+                attackerPack: atkHeroes.slice().sort((a, b) => a - b),
+                attackerPet: atkPet,
+                defenderPack: defHeroes.slice().sort((a, b) => a - b),
+                defenderPet: defPet,
+                win: !!r?.win,
+                probability,
+                defenderName: enemy.user?.name || '',
+                defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
+                attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
+                source: 'grandArena',
+                battleOrder: r?.battleOrder ?? i,
+            });
+        }
+
+        await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Гранд-Арена', 'grandArena');
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (ГА):', e);
-        HWHFuncs.setProgress('Гранд-Арена: ошибка — ' + e.message, 5000);
+        HWHFuncs.setProgress('ГА: ошибка — ' + e.message, 5000);
         return false;
     }
 }
@@ -543,14 +721,11 @@ function installActionButtons() {
     const arr = HWHData.actionsPopupButtons;
     if (!arr) return false;
     ensureSquareButtonStyle();
-
     for (let i = arr.length - 1; i >= 0; i--) {
         if (arr[i] && (arr[i].__arena || arr[i].__grandArena || arr[i].__arenaSettings || arr[i].__friendlyClans)) {
             arr.splice(i, 1);
         }
     }
-
-    // Арена → ⚙️ → 🌐 → Гранд-Арена
     arr.push({
         __arena: true,
         get msg() { return 'Провести 1 бой на Арене'; },
@@ -569,7 +744,7 @@ function installActionButtons() {
     arr.push({
         __friendlyClans: true,
         get msg() { return '🌐'; },
-        get title() { return 'Дружественные гильдии (не атаковать)'; },
+        get title() { return 'Дружественные гильдии'; },
         result() { openFriendlyClansDialog(); },
         color: 'green',
         classes: ['fixedSquare'],
@@ -584,7 +759,6 @@ function installActionButtons() {
     console.log(LOG, 'кнопки добавлены: Арена, ⚙️, 🌐, Гранд-Арена');
     return true;
 }
-
 function patchDoYourBest() {
     const Original = HWHClasses.doYourBest;
     if (!Original || Original.__patched) return false;
@@ -592,8 +766,8 @@ function patchDoYourBest() {
         constructor(...args) {
             super(...args);
             const idx = this.funcList.findIndex(f => f.name === 'testDungeon');
-            const arenaItem = { name: 'oneArenaBattle', label: 'Провести 1 бой на арене', title: 'Провести 1 бой на арене текущей пачкой', checked: false };
-            const grandItem = { name: 'oneGrandArenaBattle', label: 'Провести 1 бой на Гранд-Арене', title: 'Провести 1 бой на Гранд-Арене (3 пачки)', checked: false };
+            const arenaItem = { name: 'oneArenaBattle', label: 'Провести 1 бой на арене', checked: false };
+            const grandItem = { name: 'oneGrandArenaBattle', label: 'Провести 1 бой на Гранд-Арене', checked: false };
             if (idx >= 0) this.funcList.splice(idx + 1, 0, arenaItem, grandItem);
             else this.funcList.push(arenaItem, grandItem);
             this.functions.oneArenaBattle = runArenaBattle;
