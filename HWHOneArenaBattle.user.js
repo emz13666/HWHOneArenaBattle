@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.3
+// @version      4.4
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -20,7 +20,6 @@
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
 
-
 (async function () {
 'use strict';
 
@@ -32,7 +31,8 @@ const DB_NAME = 'HWHOneArenaBattle';
 const DB_STORE = 'battles';
 const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
 const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
-const SIM_COUNT = 20;
+const SIM_COUNT = 10;
+const MIN_PROBABILITY_TO_SAVE = 0.6;
 const HISTORY_PAGE_LIMIT = 20;
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
@@ -135,7 +135,7 @@ async function openSettingsDialog() {
             { name: 'onlyIfNoAttacksTodayArena', label: 'Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayArena },
             { name: 'onlyIfNoAttacksTodayGrand', label: 'Гранд-Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayGrand },
             { name: 'noAttackFriendlyClans', label: 'Не атаковать дружественные гильдии', checked: s.noAttackFriendlyClans },
-            { name: 'useBestPackFromHistory', label: 'Использовать лучшую пачку из истории (по simProbability)', checked: s.useBestPackFromHistory },
+            { name: 'useBestPackFromHistory', label: 'При автоатаке на арене искать лучшую пачку в истории боёв', checked: s.useBestPackFromHistory },
         ]
     );
     if (!result) { console.log(LOG, 'настройки: отмена'); return; }
@@ -172,14 +172,34 @@ if (!document.getElementById('hwh-arena-friend-btns')) {
     const st = document.createElement('style');
     st.id = 'hwh-arena-friend-btns';
     st.textContent = `
+        /* Сокет и ряд растягиваем на всю ширину, но с внутренними отступами */
+        .PopUp_blocks > .PopUp_btnSocket:has(.arenaFriendBtn) {
+            align-self: stretch;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 4px 6px 6px 6px;
+        }
+        .PopUp_blocks > .PopUp_btnSocket > .PopUp_btnRow {
+            width: 100%;
+            box-sizing: border-box;
+            gap: 4px;               /* отступ между кнопками */
+        }
+
+        /* Кнопки одинаковой ширины, ничего не вылезает */
         .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn {
-            flex: 0 0 auto;
+            flex: 1 1 0;
+            min-width: 0;
+            box-sizing: border-box;
+            padding-left: 0;
+            padding-right: 0;
         }
         .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate {
+            width: 100%;
             min-width: 0;
-            padding-left: 10px;
-            padding-right: 10px;
-            font-size: 13px;
+            box-sizing: border-box;
+            padding-left: 4px;
+            padding-right: 4px;
+            font-size: 14px;
             white-space: nowrap;
         }
     `;
@@ -188,8 +208,8 @@ if (!document.getElementById('hwh-arena-friend-btns')) {
     const result = await HWHFuncs.popup.confirm(
         `Дружественные гильдии (${ids.length})`,
       [
-    { msg: 'OK',        result: true,      color: 'green',  classes: ['arenaFriendBtn'], isOneSocket: true },
-    { msg: 'Обновить',  result: 'refresh', color: 'orange', classes: ['arenaFriendBtn'] },
+    { msg: '  OK  ',        result: true,      color: 'green',  classes: ['arenaFriendBtn'], isOneSocket: true },
+    { msg: 'Список',  result: 'refresh', color: 'orange', classes: ['arenaFriendBtn'] },
     { msg: 'Отмена',    result: false,     color: 'red',    isCancel: true, classes: ['arenaFriendBtn'] },
 ],
       checkboxes
@@ -328,10 +348,10 @@ function reportBattleResult(result, label, kind) {
         console.log(LOG, 'по боям:', battles.map(b => ({ order: b?.result?.battleOrder, win: b?.result?.win, stars: b?.result?.stars })));
         if (winFinal) {
             console.log(LOG, `Гранд-Арена ПОБЕДА ${score}`);
-            HWHFuncs.setProgress(`Гранд-Арена: ПОБЕДА ${score}`, 5000);
+            HWHFuncs.setProgress(`Гранд-Арена: ПОБЕДА`, 5000);
         } else {
             console.log(LOG, `Гранд-Арена ПОРАЖЕНИЕ ${score}`);
-            HWHFuncs.setProgress(`Гранд-Арена: ПОРАЖЕНИЕ ${score}`, 5000);
+            HWHFuncs.setProgress(`Гранд-Арена: ПОРАЖЕНИЕ`, 5000);
         }
         return;
     }
@@ -512,6 +532,7 @@ async function importArenaHistoryFromServer() {
 
     const LIMIT = 20; // сервер не принимает > 20
     let totalImported = 0;
+    let totalSkippedLowProb = 0;
     let totalDuplicates = 0;
     let totalForeign = 0;
 
@@ -562,11 +583,19 @@ async function importArenaHistoryFromServer() {
 
                 const prob = await calcProbabilityForReplay(replay);
 
+                if (prob !== null && prob < MIN_PROBABILITY_TO_SAVE) {
+                    totalSkippedLowProb++;
+                    console.log(
+                        LOG,
+                        `импорт: пропущен replayId=${replay.id} — probability ${(prob * 100).toFixed(0)}% < ${(MIN_PROBABILITY_TO_SAVE * 100)}%`
+                    );
+                    continue;
+                }
+
                 for (const rec of records) {
                     rec.probability = prob;
                     await saveBattleToDB(rec);
                     totalImported++;
-                    srcImported++;
                 }
             }
 
@@ -586,7 +615,7 @@ async function importArenaHistoryFromServer() {
         console.log(LOG, `${source}: итог — сохранено ${srcImported}`);
     }
 
-    const summary = `История: +${totalImported} новых (дублей ${totalDuplicates}, не моих ${totalForeign})`;
+    const summary = `История: +${totalImported} новых (дублей ${totalDuplicates}, не моих атак ${totalForeign}, низкий шанс ${totalSkippedLowProb})`;
     console.log(LOG, summary);
     HWHFuncs.setProgress(summary, 6000);
     return totalImported;
@@ -895,20 +924,23 @@ async function runArenaBattle() {
             probability = await calcProbability(battle, SIM_COUNT);
             console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
         }
-        await saveBattleToDB({
-            ts: Date.now(),
-            attackerPack: heroes.slice().sort((a, b) => a - b),
-            attackerPet: pet,
-            defenderPack: defHeroes.slice().sort((a, b) => a - b),
-            defenderPet: defPet,
-            win: !!battle?.result?.win,
-            probability,
-            defenderName: enemy.user?.name || '',
-            defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
-            attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
-            source: 'arena',
-        });
-
+        if (probability === null || probability >= MIN_PROBABILITY_TO_SAVE) {
+            await saveBattleToDB({
+                ts: Date.now(),
+                attackerPack: heroes.slice().sort((a, b) => a - b),
+                attackerPet: pet,
+                defenderPack: defHeroes.slice().sort((a, b) => a - b),
+                defenderPet: defPet,
+                win: !!battle?.result?.win,
+                probability,
+                defenderName: enemy.user?.name || '',
+                defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
+                attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
+                source: 'arena',
+            });
+        } else {
+            console.log(LOG, `Арена: бой не сохранён — probability ${(probability * 100).toFixed(0)}% < ${(MIN_PROBABILITY_TO_SAVE * 100)}%`);
+        }
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
         try { await importArenaHistoryFromServer(); } catch (e) { console.warn(LOG, e); }
