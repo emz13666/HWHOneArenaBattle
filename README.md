@@ -37,7 +37,7 @@
 ## Установка
 
 1. Установите [HeroWarsHelper](https://greasyfork.org/ru/scripts/450693-herowarshelper) (обязательно, без него расширение не работает).
-2. Установите [HWHOneArenaBattle]([https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js]) через Tampermonkey / Violentmonkey / Greasemonkey.
+2. Установите [HWHOneArenaBattle](https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js) через Tampermonkey / Violentmonkey / Greasemonkey.
 3. Откройте игру Hero Wars.
 
 ## Использование
