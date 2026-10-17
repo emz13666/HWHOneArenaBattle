@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.5
+// @version      4.6
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -19,7 +19,6 @@
 // @downloadURL  https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
-
 
 (async function () {
 'use strict';
@@ -324,10 +323,10 @@ function reportBattleResult(result, label, kind) {
     if (r) {
         if (r.win) {
             console.log(LOG, `Арена ПОБЕДА: ${r.oldPlace} → ${r.newPlace}`);
-            HWHFuncs.setProgress(`Арена: ПОБЕДА ${r.oldPlace ?? '?'} → ${r.newPlace ?? '?'}`, 5000);
+            HWHFuncs.setProgress(`Арена: ПОБЕДА ${r.oldPlace ?? '?'} → ${r.newPlace ?? '?'}<br>Загрузка истории...`, 5000);
         } else {
             console.log(LOG, `Арена ПОРАЖЕНИЕ${r.oldPlace ? ` (${r.oldPlace})` : ''}`);
-            HWHFuncs.setProgress(`Арена: ПОРАЖЕНИЕ`, 5000);
+            HWHFuncs.setProgress(`Арена: ПОРАЖЕНИЕ<br>Загрузка истории...`, 5000);
         }
     } else {
         console.log(LOG, 'Арена: результат не получен');
@@ -350,6 +349,7 @@ async function calcProbability(battle, N = SIM_COUNT) {
         } catch (e) {
             console.warn(LOG, `симуляция ${i + 1}/${N} упала:`, e.message);
         }
+        await new Promise(r => setTimeout(r, 20));
     }
     if (total === 0) return null;
     return wins / total;
@@ -411,17 +411,20 @@ async function saveBattleToDB(record) {
     }
 }
 /* ================================================================= */
-/* === ИМПОРТ ИСТОРИИ АРЕНЫ ИЗ battleGetByType (v4.3)              === */
+/* === ИМПОРТ ИСТОРИИ АРЕНЫ ИЗ battleGetByType (v4.6)              = */
 /* ================================================================= */
 function extractPackFromTeam(teamObj) {
-    const ids = Object.values(teamObj || {})
-        .map(u => u && u.id)
-        .filter(Boolean);
-    const heroes = ids.filter(id => id < 6000).sort((a, b) => a - b);
-    const pet = ids.find(id => id >= 6000) || null;
-    return { heroes, pet };
+    const units = Object.values(teamObj || {}).filter(u => u && u.id);
+    const heroes = units.filter(u => u.id < 6000).map(u => u.id).sort((a, b) => a - b);
+    const pet = units.find(u => u.id >= 6000)?.id || null;
+    const favor = {};
+    for (const u of units) {
+        if (u.id < 6000 && u.favorPetId) {
+            favor[u.id] = u.favorPetId;
+        }
+    }
+    return { heroes, pet, favor };
 }
-
 function convertReplayToRecords(replay, myUserId, source) {
     // battleGetByType: userId — владелец записи (я, если я атакующий);
     // typeId — противник. Моя атака = userId === myId.
@@ -448,8 +451,10 @@ function convertReplayToRecords(replay, myUserId, source) {
             ...base,
             attackerPack: atk.heroes,
             attackerPet: atk.pet,
+            attackerFavor: atk.favor,
             defenderPack: def.heroes,
             defenderPet: def.pet,
+            defenderFavor: def.favor,
             win: !!replay.result?.win,
             probability: null,
         }];
@@ -496,7 +501,7 @@ async function importArenaHistoryFromServer(maxPages = Infinity) {
     let totalForeign = 0;
 
     console.log(LOG, `=== Импорт истории Арены (myUserId=${myUserId}) ===`);
-    HWHFuncs.setProgress('История Арены: загрузка...', false);
+    //HWHFuncs.setProgress('История Арены: загрузка...', false);
 
     for (const source of ['arena']) {
         const type = source === 'arena' ? 'arena' : 'grand';
@@ -717,6 +722,7 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
                 byAttacker.set(akey, {
                     attackerPack: r.attackerPack,
                     attackerPet: r.attackerPet,
+                    attackerFavor: r.attackerFavor || {},
                     wins: 0,
                     total: 0,
                     simSum: 0,
@@ -830,7 +836,7 @@ async function runArenaBattle() {
         const arenaTeam = (teamGetAll?.arena) || [];
         let heroes = arenaTeam.filter(id => id < 6000).slice(0, 5);
         let pet = arenaTeam.filter(id => id >= 6000).pop() || null;
-        const favor = (teamGetFavor?.arena) || {};
+        let favor = (teamGetFavor?.arena) || {};
 
         const tgb = team_getBanners || {};
         let arenaBannerId = tgb.arena || null;
@@ -862,6 +868,15 @@ async function runArenaBattle() {
             if (best) {
                 heroes = best.attackerPack.slice();
                 pet = best.attackerPet;
+                const newFavor = {};
+                for (const hid of heroes) {
+                    if (best.attackerFavor?.[hid]) {
+                        newFavor[hid] = best.attackerFavor[hid];
+                    } else if (favor[hid]) {
+                        newFavor[hid] = favor[hid];
+                    }
+                }
+                favor = newFavor;
                 console.log(LOG, `Арена: используем лучшую пачку из БД: [${heroes.join(',')}] пет ${pet || '-'}`);
             }
         }
@@ -887,6 +902,7 @@ async function runArenaBattle() {
                 ts: Date.now(),
                 attackerPack: heroes.slice().sort((a, b) => a - b),
                 attackerPet: pet,
+                attackerFavor: favor,
                 defenderPack: defHeroes.slice().sort((a, b) => a - b),
                 defenderPet: defPet,
                 win: !!battle?.result?.win,
@@ -903,7 +919,9 @@ async function runArenaBattle() {
         }
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
+        
         try { await importArenaHistoryFromServer(1); } catch (e) { console.warn(LOG, e); }
+        
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (Арена):', e);
@@ -1129,7 +1147,5 @@ const retryTimer = setInterval(() => {
         else console.warn(LOG, 'не удалось установить элементы за 60 сек');
     }
 }, 500);
-
 try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
-
 })();
