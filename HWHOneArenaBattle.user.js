@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.9
+// @version      4.10
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -120,6 +120,7 @@ const { Caller, HWHFuncs, HWHClasses, HWHData } = globalThis;
 
 /* ===== НАСТРОЙКИ ===== */
 const defaultSettings = {
+    saveHistory: true,
     onlyIfNoAttacksTodayArena: false,
     onlyIfNoAttacksTodayGrand: false,
     noAttackFriendlyClans: true,
@@ -199,24 +200,32 @@ async function openSettingsDialog() {
             { msg: 'Отмена', result: false, isCancel: true, color: 'red' },
         ],
         [
+            { name: 'saveHistory', label: 'Сохранять историю боёв (расчёт вероятности)', checked: s.saveHistory },
+            { name: 'useBestPackFromHistory', label: 'При автоатаке искать лучшую пачку в истории боёв (недоступно без истории боёв)', checked: s.useBestPackFromHistory && s.saveHistory },
             { name: 'onlyIfNoAttacksTodayArena', label: 'Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayArena },
             { name: 'onlyIfNoAttacksTodayGrand', label: 'Гранд-Арена: атаковать только если не было атак за сегодня', checked: s.onlyIfNoAttacksTodayGrand },
             { name: 'noAttackFriendlyClans', label: 'Не атаковать дружественные гильдии', checked: s.noAttackFriendlyClans },
-            { name: 'useBestPackFromHistory', label: 'При автоатаке искать лучшую пачку в истории боёв', checked: s.useBestPackFromHistory },
-            { name: 'grandShuffle', label: 'Гранд-Арена: автосмена защиты каждые 15 секунд', checked: s.grandShuffle },
+            { name: 'grandShuffle', label: 'ГА: автосмена защиты каждые 15 секунд', checked: s.grandShuffle },
         ]
     );
     if (!result) { console.log(LOG, 'настройки: отмена'); return; }
     const boxes = HWHFuncs.popup.getCheckBoxes();
     const newSettings = { ...s };
     for (const b of boxes) if (b.name in newSettings) newSettings[b.name] = b.checked;
+
+    // Если выключили историю — принудительно выключаем и автовыбор пачки
+    if (!newSettings.saveHistory) {
+        newSettings.useBestPackFromHistory = false;
+    }
+
     saveSettings(newSettings);
-    if (newSettings.grandShuffle && !grandShuffleEnabled) startGrandShuffle();
-    if (!newSettings.grandShuffle && grandShuffleEnabled) stopGrandShuffle();
     console.log(LOG, 'настройки сохранены:', newSettings);
     HWHFuncs.setProgress('Настройки сохранены', 3000);
-}
 
+    // Старт/стоп автосмены ГА
+    if (newSettings.grandShuffle && !grandShuffleEnabled) startGrandShuffle();
+    if (!newSettings.grandShuffle && grandShuffleEnabled) stopGrandShuffle();
+}
 /* ===== ДИАЛОГ: дружественные гильдии ===== */
 async function openFriendlyClansDialog() {
     HWHFuncs.setProgress('Загрузка списка гильдий...');
@@ -840,6 +849,16 @@ async function importAllDB() {
 }
 
 async function openHistoryDialog() {
+    if (!loadSettings().saveHistory) {
+        const go = await HWHFuncs.popup.confirm(
+            'Сохранение истории боёв отключено в настройках.<br>Открыть историю всё равно?',
+            [
+                { msg: 'Открыть', result: true, color: 'green' },
+                { msg: 'Отмена', result: false, isCancel: true, color: 'red' },
+            ]
+        );
+        if (!go) return;
+    }
     const result = await HWHFuncs.popup.confirm(
         'История боёв (IndexedDB)',
         [
@@ -937,23 +956,42 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
 }
 
 async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPetsArr, currentFavor) {
-    if (!HWHClasses.Database) return null;
-    if (!enemyVisibleTeams || !enemyVisibleTeams.length) return null;
-
+    if (!HWHClasses.Database) {
+        console.log(LOG, 'ГА-поиск: HWHClasses.Database недоступен');
+        return null;
+    }
+    if (!enemyVisibleTeams || !enemyVisibleTeams.length) {
+        console.log(LOG, 'ГА-поиск: нет видимых пачек защиты');
+        return null;
+    }
     try {
         const dbG = new HWHClasses.Database(DB_NAME_GRAND, DB_STORE_GRAND);
         await dbG.open();
         const all = await dbGetAllGrand(dbG);
-        if (!all.length) return null;
+        console.log(LOG, `ГА-поиск: записей в истории ГА = ${all.length}, видимых защит = ${enemyVisibleTeams.length}`);
+       if (!all.length) {
+            console.log(LOG, 'ГА-поиск: история ГА пуста');
+            return null;
+        }
 
         const bestPerDef = [];
 
         for (const defTeam of enemyVisibleTeams) {
             const defHeroes = (defTeam.heroes || []).filter(h => h.id < 6000).map(h => h.id);
             const defPet    = (defTeam.heroes || []).find(h => h.id >= 6000)?.id || null;
-            if (!defHeroes.length) continue;
+             if (!defHeroes.length) {
+                console.log(LOG, 'ГА-поиск: пачка защиты без героев, пропуск');
+                continue;
+            }
 
             const targetKey = packKey(defHeroes, defPet);
+            const exactCount = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey).length;
+            const fuzzyCount = all.filter(r => {
+                const sim = packSimilarity(r.defenderPack || [], defHeroes);
+                return sim >= 0.8 && (!defPet || !r.defenderPet || defPet === r.defenderPet);
+            }).length;
+
+            console.log(LOG, `ГА-поиск: защита [${defHeroes.join(',')}]|${defPet || '-'}: точных=${exactCount}, похожих=${fuzzyCount}`);
 
             let source = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey);
 
@@ -966,7 +1004,10 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
                 });
             }
 
-            if (!source.length) continue;
+             if (!source.length) {
+                console.log(LOG, `ГА-поиск: для этой защиты матчей нет`);
+                continue;
+            }
 
             const byAtk = new Map();
             for (const r of source) {
@@ -1153,7 +1194,7 @@ async function runArenaBattle() {
         const defHeroes = (enemy.heroes || []).filter(h => h.id < 6000).map(h => h.id);
         const defPet    = (enemy.heroes || []).find(h => h.id >= 6000)?.id || null;
 
-        if (settings.useBestPackFromHistory) {
+        if (settings.saveHistory && settings.useBestPackFromHistory) {
             HWHFuncs.setProgress('Арена: поиск лучшей пачки для атаки в истории боёв...', false);
             const best = await tryUseBestPack('arena', defHeroes, defPet, heroes, pet);
             if (best) {
@@ -1181,42 +1222,58 @@ async function runArenaBattle() {
         try { result = await Caller.send({ name: 'arenaAttack', args }); }
         catch (e) { if (handleRefillError(e, 'arena')) return false; throw e; }
 
-        const battle = result?.battles?.[0];
-        let probability = null;
-        if (battle) {
-            HWHFuncs.setProgress('Арена: расчёт вероятности...', false);
-            probability = await calcProbability(battle, SIM_COUNT);
-            console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
-        }
-        if (probability !== null && probability >= MIN_PROBABILITY_TO_SAVE) {
-            await saveBattleToDB({
-                ts: Date.now(),
-                attackerPack: heroes.slice().sort((a, b) => a - b),
-                attackerPet: pet,
-                attackerFavor: favor,
-                defenderPack: defHeroes.slice().sort((a, b) => a - b),
-                defenderPet: defPet,
-                win: !!battle?.result?.win,
-                probability,
-                defenderName: enemy.user?.name || '',
-                defenderClanId: enemy.user?.clanId ? String(enemy.user.clanId) : null,
-                attackerClanId: userGetInfo?.clanId ? String(userGetInfo.clanId) : null,
-                source: 'arena',
-                replayId: battle?.id
-            });
-        } else {
-            const probStr = probability === null ? 'н/д' : `${(probability * 100).toFixed(0)}%`;
-            console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
-        }
         await pruneOldBattlesIfNeeded();
         reportBattleResult(result, 'Арена', 'arena');
 
-        // Импорт — в фоне, чтобы не блокировать UI после результата
-        (async () => {
-            try { await importArenaHistoryFromServer(1); } catch (e) { console.warn(LOG, e); }
-        })();
+        // Расчёт probability, сохранение и импорт — в фоне
+        const battle = result?.battles?.[0];
+        const heroesForSave = heroes.slice();
+        const petForSave = pet;
+        const favorForSave = { ...favor };
+        const defHeroesForSave = defHeroes.slice();
+        const defPetForSave = defPet;
+        const enemyForSave = enemy;
+        const userInfoForSave = userGetInfo;
 
-        return true;    } catch (e) {
+        if (settings.saveHistory) {
+            (async () => {
+                try {
+                    let probability = null;
+                    if (battle) {
+                        probability = await calcProbability(battle, SIM_COUNT);
+                        console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
+                    }
+                    if (probability !== null && probability >= MIN_PROBABILITY_TO_SAVE) {
+                        await saveBattleToDB({
+                            ts: Date.now(),
+                            attackerPack: heroesForSave.slice().sort((a, b) => a - b),
+                            attackerPet: petForSave,
+                            attackerFavor: favorForSave,
+                            defenderPack: defHeroesForSave.slice().sort((a, b) => a - b),
+                            defenderPet: defPetForSave,
+                            win: !!battle?.result?.win,
+                            probability,
+                            defenderName: enemyForSave.user?.name || '',
+                            defenderClanId: enemyForSave.user?.clanId ? String(enemyForSave.user.clanId) : null,
+                            attackerClanId: userInfoForSave?.clanId ? String(userInfoForSave.clanId) : null,
+                            source: 'arena',
+                            replayId: battle?.id
+                        });
+                    } else {
+                        const probStr = probability === null ? 'н/д' : `${(probability * 100).toFixed(0)}%`;
+                        console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
+                    }
+                    await importArenaHistoryFromServer(1);
+                } catch (e) {
+                    console.warn(LOG, 'фоновый расчёт Арены ошибка:', e);
+                }
+            })();
+        } else {
+            console.log(LOG, 'Арена: сохранение истории выключено — расчёт вероятности и запись в БД пропущены');
+        }
+
+        return true;
+    } catch (e) {
         console.error(LOG, 'ошибка (Арена):', e);
         HWHFuncs.setProgress('Арена: ошибка — ' + e.message, 5000);
         return false;
@@ -1353,7 +1410,7 @@ async function runGrandArenaBattle() {
         const enemy = await pickGrandEnemy(userGetInfo?.clanId, settings.noAttackFriendlyClans);
         console.log(LOG, 'Гранд-арена: бой с', enemy.user?.name || enemy.userId);
 
-        if (settings.useBestPackFromHistory) {
+        if (settings.saveHistory && settings.useBestPackFromHistory) {
             HWHFuncs.setProgress('Гранд-арена: поиск лучших пачек для атаки в истории боёв...', false);
             const visibleTeams = (enemy.heroes || []).map(teamArr => ({
                 heroes: Array.isArray(teamArr) ? teamArr : Object.values(teamArr || {}),
@@ -1392,42 +1449,46 @@ async function runGrandArenaBattle() {
         const battles = result?.battles || [];
         const enemyForSave = enemy;
         const userInfoForSave = userGetInfo;
-        (async () => {
-            try {
-                for (let i = 0; i < battles.length; i++) {
-                    const b = battles[i];
-                    const atk = extractPackFromTeam(b.attackers || {});
-                    const defArr = Array.isArray(b.defenders) ? b.defenders : [b.defenders];
-                    const def = extractPackFromTeam(defArr[0] || {});
-                    if (!atk.heroes.length) continue;
+        if (settings.saveHistory) {
+            (async () => {
+                try {
+                    for (let i = 0; i < battles.length; i++) {
+                        const b = battles[i];
+                        const atk = extractPackFromTeam(b.attackers || {});
+                        const defArr = Array.isArray(b.defenders) ? b.defenders : [b.defenders];
+                        const def = extractPackFromTeam(defArr[0] || {});
+                        if (!atk.heroes.length) continue;
 
-                    const prob = await calcProbabilityForReplay(b);
-                    if (prob !== null && prob >= MIN_PROBABILITY_TO_SAVE) {
-                        await saveGrandBattleToDB({
-                            ts: Date.now() + i,
-                            replayId: b.id || `g_${enemyForSave.userId}_${Date.now()}_${i}`,
-                            defenderId: String(enemyForSave.userId),
-                            defenderName: enemyForSave.user?.name || '',
-                            defenderClanId: enemyForSave.user?.clanId ? String(enemyForSave.user.clanId) : null,
-                            attackerClanId: userInfoForSave?.clanId ? String(userInfoForSave.clanId) : null,
-                            attackerPack: atk.heroes,
-                            attackerPet: atk.pet,
-                            attackerFavor: atk.favor,
-                            defenderPack: def.heroes,
-                            defenderPet: def.pet,
-                            defenderFavor: def.favor,
-                            win: !!b.result?.win,
-                            probability: prob,
-                            battleOrder: b.result?.battleOrder ?? i,
-                            source: 'grandArena',
-                        });
+                        const prob = await calcProbabilityForReplay(b);
+                        if (prob !== null && prob >= MIN_PROBABILITY_TO_SAVE) {
+                            await saveGrandBattleToDB({
+                                ts: Date.now() + i,
+                                replayId: b.id || `g_${enemyForSave.userId}_${Date.now()}_${i}`,
+                                defenderId: String(enemyForSave.userId),
+                                defenderName: enemyForSave.user?.name || '',
+                                defenderClanId: enemyForSave.user?.clanId ? String(enemyForSave.user.clanId) : null,
+                                attackerClanId: userInfoForSave?.clanId ? String(userInfoForSave.clanId) : null,
+                                attackerPack: atk.heroes,
+                                attackerPet: atk.pet,
+                                attackerFavor: atk.favor,
+                                defenderPack: def.heroes,
+                                defenderPet: def.pet,
+                                defenderFavor: def.favor,
+                                win: !!b.result?.win,
+                                probability: prob,
+                                battleOrder: b.result?.battleOrder ?? i,
+                                source: 'grandArena',
+                            });
+                        }
                     }
+                    await importArenaHistoryFromServer(1);
+                } catch (e) {
+                    console.warn(LOG, 'фоновый расчёт ГА ошибка:', e);
                 }
-                await importArenaHistoryFromServer(1);
-            } catch (e) {
-                console.warn(LOG, 'фоновый расчёт ГА ошибка:', e);
-            }
-        })();
+            })();
+        } else {
+            console.log(LOG, 'ГА: сохранение истории выключено — расчёт вероятности и запись в БД пропущены');
+        }
 
         return true;
     } catch (e) {
