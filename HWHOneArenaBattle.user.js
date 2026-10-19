@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.10
+// @version      4.11
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666
@@ -34,9 +34,9 @@ const DB_STORE_GRAND = 'grandBattles';
 const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
 const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
 const SIM_COUNT = 5;
-const MIN_PROBABILITY_TO_SAVE = 0.6;
+const MIN_PROBABILITY_TO_SAVE = 0.5;
 const SEEN_REPLAYS_KEY = 'HWHOneArenaBattle.seenReplays';
-const SEEN_REPLAYS_MAX = 50;
+const SEEN_REPLAYS_MAX = 500;
 const GRAND_SHUFFLE_INTERVAL_MS = 15000;
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
@@ -659,61 +659,108 @@ async function importArenaHistoryFromServer(maxPages = Infinity) {
             console.log(LOG, `${source} стр.${page}: получено ${replays.length} реплеев`);
             if (!replays.length) break;
 
-            const total = replays.length;
-            let idx = 0;
+            // === ПРЕДФИЛЬТРАЦИЯ СТРАНИЦЫ ===
+            // Отсеиваем дубликаты, уже посчитанные и чужие атаки ДО основного цикла,
+            // чтобы total/idx отражали реальную работу, а не перебор.
+            const fresh = [];
+            let pageDuplicates = 0;
+            let pageSeen = 0;
+            let pageForeign = 0;
 
             for (const replay of replays) {
+                const rid = String(replay.id);
+
+                // 1. Уже в БД?
+                if (existingIds.has(rid)) {
+                    pageDuplicates++;
+                    totalDuplicates++;
+                    srcDuplicates++;
+                    continue;
+                }
+
+                // 2. Уже считали в прошлый раз?
+                if (seenReplays.has(rid)) {
+                    pageSeen++;
+                    totalSeen++;
+                    srcSeen++;
+                    continue;
+                }
+
+                // 3. Не моя атака?
+                if (String(replay.userId) !== myUserId) {
+                    pageForeign++;
+                    totalForeign++;
+                    srcForeign++;
+                    continue;
+                }
+
+                fresh.push(replay);
+            }
+
+            console.log(
+                LOG,
+                `${source} стр.${page}: новых ${fresh.length} ` +
+                `(дублей ${pageDuplicates}, уже считалось ${pageSeen}, не моих ${pageForeign})`
+            );
+
+            if (!fresh.length) {
+                // На странице нет ничего нового — сразу следующая, без мигания статуса.
+                HWHFuncs.setProgress(
+                    `История ${source}: стр.${page} — новых нет (дублей ${pageDuplicates}, считалось ${pageSeen}, чужих ${pageForeign})`,
+                    false
+                );
+                if (replays.length < LIMIT) break;
+                offset += LIMIT;
+                await new Promise(r => setTimeout(r, 200));
+                continue;
+            }
+
+            // === ОСНОВНОЙ ЦИКЛ ТОЛЬКО ПО НОВЫМ ===
+            const total = fresh.length;
+            let idx = 0;
+
+            for (const replay of fresh) {
                 idx++;
                 const replayIdStr = String(replay.id);
                 const prefix = `История ${source} [${idx}/${total}]:`;
 
-                // 1. Уже в БД?
-                if (existingIds.has(replayIdStr)) {
-                    totalDuplicates++; srcDuplicates++;
-                    pushLiveStatus(`${prefix} дубликат`);
-                    continue;
-                }
-
-                // 2. Не моя атака?
+                // Конвертация (страховка: если convert вернёт null — считаем чужой)
                 const records = convertReplayToRecords(replay, myUserId, source);
                 if (!records) {
-                    totalForeign++; srcForeign++;
+                    totalForeign++;
+                    srcForeign++;
                     pushLiveStatus(`${prefix} не моя атака`);
                     continue;
                 }
 
-                // 3. Уже считали в прошлый раз?
-                if (seenReplays.has(replayIdStr)) {
-                    totalSeen++; srcSeen++;
-                    pushLiveStatus(`${prefix} уже считался, пропуск`);
-                    continue;
-                }
-
-                // 4. Считаем с живым таймером
+                // Расчёт с живым таймером
                 startLiveStatus(`${prefix} расчёт вероятности`);
                 const prob = await calcProbabilityForReplay(replay);
 
-                // 5. Низкая вероятность?
+                // Низкая вероятность?
                 if (prob !== null && prob < MIN_PROBABILITY_TO_SAVE) {
-                    totalSkippedLowProb++; srcSkippedProb++;
+                    totalSkippedLowProb++;
+                    srcSkippedProb++;
                     seenReplays.add(replayIdStr);
                     stopLiveStatus(`${prefix} ${(prob * 100).toFixed(0)}% — пропуск (< ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%)`);
                     console.log(LOG, `импорт: пропущен replayId=${replay.id} — probability ${(prob * 100).toFixed(0)}% < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
                     continue;
                 }
 
-                // 6. Сохраняем
+                // Сохраняем
                 for (const rec of records) {
                     rec.probability = prob;
                     if (source === 'arena') await saveBattleToDB(rec);
                     else await saveGrandBattleToDB(rec);
                     existingIds.add(replayIdStr);
-                    totalImported++; srcImported++;
+                    totalImported++;
+                    srcImported++;
                 }
                 seenReplays.add(replayIdStr);
                 totalProcessed++;
                 stopLiveStatus(`${prefix} ✓ сохранено (${(prob * 100).toFixed(0)}%)`);
             }
+
             if (replays.length < LIMIT) break;
             offset += LIMIT;
             await new Promise(r => setTimeout(r, 200));
@@ -906,7 +953,7 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
                 return true;
             });
             if (fuzzy.length) {
-                console.log(LOG, `точного матча нет — фолбэк на похожих защит (${fuzzy.length} записей)`);
+                console.log(LOG, `точного совпадения нет — ищем по похожим защитам (${fuzzy.length} записей)`);
             }
         }
 
@@ -969,7 +1016,7 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
         await dbG.open();
         const all = await dbGetAllGrand(dbG);
         console.log(LOG, `ГА-поиск: записей в истории ГА = ${all.length}, видимых защит = ${enemyVisibleTeams.length}`);
-       if (!all.length) {
+        if (!all.length) {
             console.log(LOG, 'ГА-поиск: история ГА пуста');
             return null;
         }
@@ -979,7 +1026,7 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
         for (const defTeam of enemyVisibleTeams) {
             const defHeroes = (defTeam.heroes || []).filter(h => h.id < 6000).map(h => h.id);
             const defPet    = (defTeam.heroes || []).find(h => h.id >= 6000)?.id || null;
-             if (!defHeroes.length) {
+            if (!defHeroes.length) {
                 console.log(LOG, 'ГА-поиск: пачка защиты без героев, пропуск');
                 continue;
             }
@@ -1004,7 +1051,7 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
                 });
             }
 
-             if (!source.length) {
+            if (!source.length) {
                 console.log(LOG, `ГА-поиск: для этой защиты матчей нет`);
                 continue;
             }
@@ -1042,12 +1089,21 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
 
         if (!bestPerDef.length) return null;
 
-        bestPerDef.sort((a, b) => b.prob - a.prob);
+        // === ФИЛЬТР ПО ПОРОГУ ===
+        const MIN_APPLY = MIN_PROBABILITY_TO_SAVE; // 0.6
+        const qualified = bestPerDef
+            .filter(p => p.prob >= MIN_APPLY)
+            .sort((a, b) => b.prob - a.prob);
+
+        if (!qualified.length) {
+            console.log(LOG, `ГА-поиск: ни одна пачка не прошла порог ${Math.round(MIN_APPLY * 100)}% — использую текущие пачки`);
+            return null;
+        }
 
         const selected = [];
         const usedHeroes = new Set();
 
-        for (const p of bestPerDef) {
+        for (const p of qualified) {
             if (selected.length >= 3) break;
             if (p.heroes.some(h => usedHeroes.has(h))) continue;
             selected.push(p);
@@ -1073,11 +1129,12 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             heroesArr: selected.map(s => s.heroes),
             petsArr: selected.map(s => s.pet),
             favor: mergedFavor,
-            stats: bestPerDef.map(p => ({
+            stats: qualified.map(p => ({
                 prob: p.prob,
                 wins: p.wins,
                 total: p.total,
                 vsDefHeroes: p.againstDefHeroes,
+                vsDefPet: p.againstDefPet,
             })),
         };
     } catch (e) {
@@ -1137,18 +1194,32 @@ async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackP
             console.log(LOG, 'лучших пачек в БД не найдено — использую сохранённую пачку');
             return null;
         }
-        const best = alts[0];
+
+        const MIN_APPLY = MIN_PROBABILITY_TO_SAVE; // 0.6
+
         console.log(LOG, `лучшие пачки (по simProbability):`);
         for (const a of alts) {
-            const marker = a.exact > 0 ? '[точных]' : '[фолбэк]';
+            const marker = a.exact > 0 ? '[точная защита]' : '[похожая защита]';
+            const pass = a.simProbability >= MIN_APPLY;
             console.log(
-                `   ${marker} [${a.attackerPack.join(',')}] пет ${a.attackerPet || '-'} → ` +
+                `   ${pass ? '✓' : '✗'} ${marker} [${a.attackerPack.join(',')}] пет ${a.attackerPet || '-'} → ` +
                 `сим ${(a.simProbability * 100).toFixed(0)}%, ` +
                 `факт ${a.wins}/${a.total} (${(a.histWinRate * 100).toFixed(0)}%), ` +
                 `матчей: ${a.matched}`
             );
         }
-        if (best.attackerPack.length !== 5) return null;
+
+        const qualified = alts
+            .filter(a => a.simProbability >= MIN_APPLY && a.attackerPack?.length === 5)
+            .sort((a, b) => b.simProbability - a.simProbability);
+
+        if (!qualified.length) {
+            console.log(LOG, `лучших пачек с сим >= ${Math.round(MIN_APPLY * 100)}% не найдено — использую текущую пачку`);
+            return null;
+        }
+
+        const best = qualified[0];
+        console.log(LOG, `выбрана пачка с сим ${(best.simProbability * 100).toFixed(0)}%`);
         return best;
     } catch (e) {
         console.warn(LOG, 'ошибка выбора пачки:', e);
@@ -1209,8 +1280,10 @@ async function runArenaBattle() {
                     }
                 }
                 favor = newFavor;
-                console.log(LOG, `Арена: используем лучшую пачку из БД: [${heroes.join(',')}] пет ${pet || '-'}`);
+                console.log(LOG, `Арена: используем лучшую пачку из истории: [${heroes.join(',')}] пет ${pet || '-'} (сим ${(best.simProbability * 100).toFixed(0)}%)`);
                 HWHFuncs.setProgress(`Арена: бой с ${enemy.user?.name || enemy.userId}`, false);
+            } else {
+                console.log(LOG, `Арена: лучшая пачка не прошла порог ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}% — использую текущую пачку`);
             }
         }
 
@@ -1359,9 +1432,24 @@ async function shuffleGrandDefense() {
 
 function startGrandShuffle() {
     if (grandShuffleTimer) return;
+
+    // Проверяем, что HWH-меню готово. Если нет — повторяем через 500 мс.
+    try {
+        const sm = HWHClasses?.ScriptMenu?.getInst?.();
+        if (!sm?.status) {
+            setTimeout(startGrandShuffle, 1000);
+            return;
+        }
+    } catch (e) {
+        setTimeout(startGrandShuffle, 1000);
+        return;
+    }
+
     grandShuffleEnabled = true;
     console.log(LOG, `ГА: автосмена защиты запущена (каждые ${GRAND_SHUFFLE_INTERVAL_MS / 1000} сек)`);
-    HWHFuncs.setProgress(`ГА: автосмена защиты каждые ${GRAND_SHUFFLE_INTERVAL_MS / 1000} сек`, 4000);
+    try {
+        HWHFuncs.setProgress(`ГА: автосмена защиты каждые ${GRAND_SHUFFLE_INTERVAL_MS / 1000} сек`, 4000);
+    } catch (e) { /* меню ещё не готово — не страшно, лог важнее */ }
 
     const tick = async () => {
         if (!grandShuffleEnabled) return;
@@ -1380,7 +1468,9 @@ function stopGrandShuffle() {
         grandShuffleTimer = null;
     }
     console.log(LOG, 'ГА: автосмена защиты остановлена');
-    HWHFuncs.setProgress('ГА: автосмена защиты остановлена', 4000);
+    try {
+        HWHFuncs.setProgress('ГА: автосмена защиты остановлена', 4000);
+    } catch (e) { /* игнорируем */ }
 }
 /* ===== ГРАНД-АРЕНА ===== */
 async function runGrandArenaBattle() {
@@ -1424,8 +1514,10 @@ async function runGrandArenaBattle() {
                     favor = best.favor;
                     console.log(LOG, `Гранд-арена: пачек из истории: ${best.stats.length}`);
                     best.stats.forEach((s, i) =>
-                        console.log(`   #${i}: ${(s.prob * 100).toFixed(0)}% (${s.wins}/${s.total}) против [${s.vsDefHeroes.join(',')}]`)
-                    );
+                                       console.log(`   #${i}: ${(s.prob * 100).toFixed(0)}% (${s.wins}/${s.total}) против [${s.vsDefHeroes.join(',')}]|${s.vsDefPet || '-'}`)
+                                      );
+                } else {
+                    console.log(LOG, `Гранд-арена: лучшие пачки не прошли порог ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}% — использую текущие пачки`);
                 }
             }
         }
@@ -1623,10 +1715,18 @@ function installActionButtons() {
 }
 function patchDoYourBest() {
     const Original = HWHClasses.doYourBest;
-    if (!Original || Original.__patched) return false;
+    if (!Original) return false;
+    // Глобальный флаг — переживает пересоздание класса
+    if (Original.__patched || HWHClasses.doYourBest.__patched) return true;
+    if (globalThis.__HWHOneArena_doYourBestPatched) return true;
+
     class Patched extends Original {
         constructor(...args) {
             super(...args);
+            // Идемпотентная вставка: убираем возможные дубли перед добавлением
+            this.funcList = (this.funcList || []).filter(
+                f => f.name !== 'oneArenaBattle' && f.name !== 'oneGrandArenaBattle'
+            );
             const idx = this.funcList.findIndex(f => f.name === 'testDungeon');
             const arenaItem = { name: 'oneArenaBattle', label: 'Провести 1 бой на арене', checked: false };
             const grandItem = { name: 'oneGrandArenaBattle', label: 'Провести 1 бой на Гранд-Арене', checked: false };
@@ -1639,6 +1739,7 @@ function patchDoYourBest() {
     }
     Patched.__patched = true;
     HWHClasses.doYourBest = Patched;
+    globalThis.__HWHOneArena_doYourBestPatched = true;
     console.log(LOG, 'галочки добавлены в "Сделать всё"');
     return true;
 }
@@ -1663,12 +1764,67 @@ const retryTimer = setInterval(() => {
     }
 }, 500);
 
-try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
-// Автостарт автосмены защиты ГА, если галочка была включена
-setTimeout(() => {
+let grandShuffleAutoStarted = false;
+function tryAutoStartGrandShuffle() {
+    if (grandShuffleAutoStarted) return;
     try {
-        if (loadSettings().grandShuffle) startGrandShuffle();
-    } catch (e) { console.warn(LOG, 'ошибка автозапуска автосмены ГА:', e); }
-}, 3000);
+        if (!loadSettings().grandShuffle) {
+            grandShuffleAutoStarted = true;
+            return;
+        }
+        // Ждём, пока HWH-меню будет готово
+        const sm = HWHClasses?.ScriptMenu?.getInst?.();
+        if (!sm?.status) {
+            setTimeout(tryAutoStartGrandShuffle, 500);
+            return;
+        }
+        grandShuffleAutoStarted = true;
+        startGrandShuffle();
+    } catch (e) {
+        console.warn(LOG, 'ошибка автозапуска автосмены ГА:', e);
+        grandShuffleAutoStarted = true;
+    }
+}
 
+//try { HWHFuncs.Events.on('startGame', () => tryAutoStartGrandShuffle()); } catch (e) {}
+
+try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
+
+/* ===== АВТОСТАРТ АВТОСМЕНЫ ГА С РЕТРАЯМИ ===== */
+(function scheduleGrandShuffleAutoStart() {
+    const START_DELAY_MS = 30000;
+    const RETRY_MS = 1000;
+    const MAX_RETRIES = 30; // до 30 попыток после первого запуска
+    let attempts = 0;
+
+    function tryStart() {
+        attempts++;
+        try {
+            if (!loadSettings().grandShuffle) {
+                console.log(LOG, 'ГА-автостарт: галочка выключена — пропуск');
+                return;
+            }
+            const sm = HWHClasses?.ScriptMenu?.getInst?.();
+            if (!sm?.status) {
+                if (attempts < MAX_RETRIES) {
+                    setTimeout(tryStart, RETRY_MS);
+                } else {
+                    console.warn(LOG, 'ГА-автостарт: HWH-меню не готово после', MAX_RETRIES, 'попыток');
+                }
+                return;
+            }
+            if (grandShuffleEnabled) {
+                console.log(LOG, 'ГА-автостарт: уже запущено');
+                return;
+            }
+            console.log(LOG, 'ГА-автостарт: запуск');
+            startGrandShuffle();
+        } catch (e) {
+            console.warn(LOG, 'ошибка автозапуска автосмены ГА:', e);
+        }
+    }
+
+    // Первая попытка — через 30 секунд, дальше — каждую секунду до успеха.
+    setTimeout(tryStart, START_DELAY_MS);
+})();
 })();
