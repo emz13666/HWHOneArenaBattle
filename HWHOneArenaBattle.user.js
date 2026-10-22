@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.17
+// @version      4.18
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666 with AI
@@ -44,6 +44,7 @@ const FRIENDLY_PLAYERS_SLOTS = 7;
 const SEARCH_MAX_ITER = 50;
 const SEARCH_FALLBACK_ITER = 10;
 const SEARCH_RETRY_DELAY_MS = 500;
+const RESULT_DISPLAY_MS = 2000;   // сколько держим «ПОБЕДА/ПОРАЖЕНИЕ» в статусе
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
     grandArena: { battle: 21, cooldown: 20, maxTries: 5, label: 'Гранд-Арена' },
@@ -66,7 +67,7 @@ let liveStatusPrefix = '';
 let liveStatusStart = 0;
 let liveStatusHistory = [];
 
-/* ===== Автосмена ГА (объявлено заранее) ===== */
+/* ===== Автосмена ГА ===== */
 let grandShuffleTimer = null;
 let grandShuffleBusy = false;
 let grandShuffleEnabled = false;
@@ -563,8 +564,8 @@ function reportBattleResult(result, label, kind) {
         const mark = winFinal ? '✅' : '❌';
         console.log(LOG, `${mark} Гранд-Арена: ${winFinal ? 'ПОБЕДА' : 'ПОРАЖЕНИЕ'} ${score}${placeInfo ? `, ${placeInfo}` : ''}`);
         console.log(LOG, 'по боям:', battles.map(b => ({ order: b?.result?.battleOrder, win: b?.result?.win, stars: b?.result?.stars })));
-        if (winFinal) HWHFuncs.setProgress(`✅ Гранд-Арена: ПОБЕДА`, 5000);
-        else HWHFuncs.setProgress(`❌ Гранд-Арена: ПОРАЖЕНИЕ`, 5000);
+        if (winFinal) HWHFuncs.setProgress(`✅ Гранд-Арена: ПОБЕДА`, RESULT_DISPLAY_MS);
+        else HWHFuncs.setProgress(`❌ Гранд-Арена: ПОРАЖЕНИЕ`, RESULT_DISPLAY_MS);
         return;
     }
 
@@ -573,14 +574,14 @@ function reportBattleResult(result, label, kind) {
         const mark = r.win ? '✅' : '❌';
         if (r.win) {
             console.log(LOG, `${mark} Арена ПОБЕДА: ${r.oldPlace} → ${r.newPlace}`);
-            HWHFuncs.setProgress(`${mark} Арена: ПОБЕДА ${r.oldPlace ?? '?'} → ${r.newPlace ?? '?'}<br>Загрузка истории...`, 5000);
+            HWHFuncs.setProgress(`${mark} Арена: ПОБЕДА ${r.oldPlace ?? '?'} → ${r.newPlace ?? '?'}`, RESULT_DISPLAY_MS);
         } else {
             console.log(LOG, `${mark} Арена ПОРАЖЕНИЕ${r.oldPlace ? ` (${r.oldPlace})` : ''}`);
-            HWHFuncs.setProgress(`${mark} Арена: ПОРАЖЕНИЕ<br>Загрузка истории...`, 5000);
+            HWHFuncs.setProgress(`${mark} Арена: ПОРАЖЕНИЕ`, RESULT_DISPLAY_MS);
         }
     } else {
         console.log(LOG, '❓ Арена: результат не получен');
-        HWHFuncs.setProgress('❓ Арена: бой завершён', 5000);
+        HWHFuncs.setProgress('❓ Арена: бой завершён', RESULT_DISPLAY_MS);
     }
 }
 
@@ -605,7 +606,7 @@ async function calcProbability(battle, N = SIM_COUNT) {
     return wins / total;
 }
 
-/* ===== INDEXEDDB: сохранение и поиск ===== */
+/* ===== INDEXEDDB ===== */
 function packKey(heroes, pet) {
     const sorted = (heroes || []).slice().sort((a, b) => a - b);
     return sorted.join(',') + '|' + (pet || '');
@@ -1177,7 +1178,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             return null;
         }
 
-        // Слоты по позициям защит: 0..2, null = не нашли
         const slots = [null, null, null];
 
         for (let defIdx = 0; defIdx < enemyVisibleTeams.length && defIdx < 3; defIdx++) {
@@ -1237,7 +1237,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
         }
 
         const qualified = slots.filter(s => s && s.prob >= MIN_PROBABILITY_TO_SAVE);
-
         if (!qualified.length) {
             console.log(LOG, `ГА-поиск: ни одна пачка не прошла порог ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
             return null;
@@ -1245,7 +1244,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
 
         console.log(LOG, `ГА-поиск: пачек >= порога: ${qualified.length} (${slots.map((s, i) => s ? `#${i + 1}:${(s.prob * 100).toFixed(0)}%` : `#${i + 1}:—`).join(', ')})`);
 
-        // Заполняем свободные позиции текущими пачками (с учётом usedHeroes по уже выбранным)
         const usedHeroes = new Set();
         for (const s of slots) if (s) s.heroes.forEach(h => usedHeroes.add(h));
 
@@ -1259,7 +1257,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
                 break;
             }
         }
-        // если совсем не хватило — просто первые свободные текущие пачки
         for (let pos = 0; pos < 3; pos++) {
             if (slots[pos]) continue;
             for (let i = 0; i < currentHeroesArr.length; i++) {
@@ -1350,7 +1347,7 @@ async function pickGrandEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempt
     throw new Error('Не удалось найти соперника (ГА)');
 }
 
-/* ===== ВЫБОР ПАЧКИ ПО simProbability ===== */
+/* ===== ВЫБОР ПАЧКИ ===== */
 async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackPet) {
     try {
         const alts = await findBestAttackerPacks(defHeroes, defPet, 5);
@@ -1391,7 +1388,7 @@ async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackP
     }
 }
 
-/* ===== ПОИСК ЦЕЛИ ПО НОВОМУ АЛГОРИТМУ ===== */
+/* ===== ПОИСК ЦЕЛИ ===== */
 async function findArenaTarget(settings, myClanId) {
     const historyHasHighProb = await hasAnyHistoryAtOrAboveThreshold('arena');
     console.log(LOG, `Арена: в истории есть бои >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%: ${historyHasHighProb}`);
@@ -1589,6 +1586,8 @@ async function runArenaBattle() {
         }
 
         await pruneOldBattlesIfNeeded();
+
+        const resultShownAt = Date.now();
         reportBattleResult(result, 'Арена', 'arena');
 
         const battle = result?.battles?.[0];
@@ -1628,6 +1627,12 @@ async function runArenaBattle() {
                         const probStr = probability === null ? 'н/д' : `${(probability * 100).toFixed(0)}%`;
                         console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
                     }
+
+                    // Даём статусу «ПОБЕДА/ПОРАЖЕНИЕ» отвисеть свои RESULT_DISPLAY_MS — как на ГА
+                    const elapsed = Date.now() - resultShownAt;
+                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
+                    if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
                     await importArenaHistoryFromServer(1);
                 } catch (e) {
                     console.warn(LOG, 'фоновый расчёт Арены ошибка:', e);
@@ -1645,18 +1650,14 @@ async function runArenaBattle() {
     }
 }
 
-/* ===== АВТОСМЕНА ЗАЩИТЫ ГРАНД-АРЕНЫ ===== */
+/* ===== АВТОСМЕНА ЗАЩИТЫ ГА ===== */
 async function readGrandDefense() {
     const names = ['arenaGetAll', 'teamGetFavor', 'team_getBanners'];
     const [arenaAll, favor, banners] = await Caller.send(names);
 
     const teams = arenaAll?.grandHeroes;
-    if (!Array.isArray(teams) || teams.length === 0) {
-        throw new Error('grandArenaNotAvailable');
-    }
-    if (teams.length !== 3) {
-        throw new Error('grandHeroes не содержит 3 пачки');
-    }
+    if (!Array.isArray(teams) || teams.length === 0) throw new Error('grandArenaNotAvailable');
+    if (teams.length !== 3) throw new Error('grandHeroes не содержит 3 пачки');
 
     const heroes = [];
     const pets = [];
@@ -1671,9 +1672,7 @@ async function readGrandDefense() {
     }
 
     const rawBanners = banners?.grand_def;
-    if (!Array.isArray(rawBanners) || rawBanners.length !== 3) {
-        throw new Error('Нет grand_def флагов');
-    }
+    if (!Array.isArray(rawBanners) || rawBanners.length !== 3) throw new Error('Нет grand_def флагов');
     const bannerIds = rawBanners.map(v => (v === null ? 0 : Number(v?.id ?? v)));
 
     const rawFavor = favor?.grand_def;
@@ -1687,11 +1686,7 @@ async function shuffleGrandDefense() {
     grandShuffleBusy = true;
     try {
         const def = await readGrandDefense();
-
-        const orders = [
-            [1, 0, 2], [2, 1, 0], [0, 2, 1],
-            [1, 2, 0], [2, 0, 1],
-        ];
+        const orders = [[1,0,2],[2,1,0],[0,2,1],[1,2,0],[2,0,1]];
         const order = orders[Math.floor(Math.random() * orders.length)];
 
         const args = {
@@ -1701,16 +1696,9 @@ async function shuffleGrandDefense() {
             banners: order.map(i => def.banners[i]),
         };
 
-        const response = await Caller.send({
-            name: 'grandSetHeroes',
-            args,
-            ident: 'grandSetHeroes',
-        });
-
+        const response = await Caller.send({ name: 'grandSetHeroes', args, ident: 'grandSetHeroes' });
         const rpcError = response?.error || response?.results?.find(r => r.result?.error)?.result.error;
-        if (rpcError) {
-            throw new Error(rpcError.description || rpcError.message || 'Ошибка grandSetHeroes');
-        }
+        if (rpcError) throw new Error(rpcError.description || rpcError.message || 'Ошибка grandSetHeroes');
         console.log(LOG, `ГА: защита переставлена в порядке [${order.join(', ')}]`);
         return true;
     } catch (e) {
@@ -1729,26 +1717,17 @@ async function shuffleGrandDefense() {
 
 function startGrandShuffle() {
     if (grandShuffleTimer) return;
-
     try {
         const sm = HWHClasses?.ScriptMenu?.getInst?.();
-        if (!sm?.status) {
-            setTimeout(startGrandShuffle, 1000);
-            return;
-        }
-    } catch (e) {
-        setTimeout(startGrandShuffle, 1000);
-        return;
-    }
+        if (!sm?.status) { setTimeout(startGrandShuffle, 1000); return; }
+    } catch (e) { setTimeout(startGrandShuffle, 1000); return; }
 
     const settings = loadSettings();
     const intervalSec = Math.max(5, Math.min(3600, Number(settings.grandShuffleIntervalSec) || 15));
 
     grandShuffleEnabled = true;
     console.log(LOG, `ГА: автосмена защиты запущена (каждые ${intervalSec} сек)`);
-    try {
-        HWHFuncs.setProgress(`ГА: автосмена защиты каждые ${intervalSec} сек`, 4000);
-    } catch (e) {}
+    try { HWHFuncs.setProgress(`ГА: автосмена защиты каждые ${intervalSec} сек`, 4000); } catch (e) {}
 
     const tick = async () => {
         if (!grandShuffleEnabled) return;
@@ -1764,14 +1743,9 @@ function startGrandShuffle() {
 
 function stopGrandShuffle() {
     grandShuffleEnabled = false;
-    if (grandShuffleTimer) {
-        clearTimeout(grandShuffleTimer);
-        grandShuffleTimer = null;
-    }
+    if (grandShuffleTimer) { clearTimeout(grandShuffleTimer); grandShuffleTimer = null; }
     console.log(LOG, 'ГА: автосмена защиты остановлена');
-    try {
-        HWHFuncs.setProgress('ГА: автосмена защиты остановлена', 4000);
-    } catch (e) {}
+    try { HWHFuncs.setProgress('ГА: автосмена защиты остановлена', 4000); } catch (e) {}
 }
 
 /* ===== ГРАНД-АРЕНА ===== */
@@ -1811,7 +1785,6 @@ async function runGrandArenaBattle() {
         if (!best) console.log(LOG, 'Гранд-арена: сработал фолбэк — бой текущими пачками');
 
         if (best) {
-            // best.heroesArr / petsArr — длина 3, индекс = позиция; null = не нашли
             heroesArr = best.heroesArr.map((h, i) => h || heroesArr[i]);
             petsArr   = best.petsArr.map((p, i) => p !== null ? p : petsArr[i]);
             favor = best.favor;
@@ -1825,19 +1798,13 @@ async function runGrandArenaBattle() {
             console.log(LOG, 'Гранд-арена: истории >= порога нет — атакуем текущими пачками');
         }
 
-        const args = {
-            userId: +enemy.userId,
-            heroes: heroesArr,
-            pets:   petsArr,
-            favor,
-            banners,
-        };
+        const args = { userId: +enemy.userId, heroes: heroesArr, pets: petsArr, favor, banners };
 
         let result;
         try {
             result = await Caller.send({ name: 'grandAttack', args });
             if (result == null) {
-                console.warn(LOG, 'grandAttack: сервер вернул null (скорее всего HTTP 500 из-за невалидных аргументов)');
+                console.warn(LOG, 'grandAttack: сервер вернул null');
                 HWHFuncs.setProgress('Гранд-арена: сервер отклонил запрос, попробуйте позже', 5000);
                 return false;
             }
@@ -1847,6 +1814,8 @@ async function runGrandArenaBattle() {
         }
 
         await pruneOldBattlesIfNeeded();
+
+        const resultShownAt = Date.now();
         reportBattleResult(result, 'Гранд-Арена', 'grandArena');
 
         const battles = result?.battles || [];
@@ -1884,6 +1853,12 @@ async function runGrandArenaBattle() {
                             });
                         }
                     }
+
+                    // Та же логика: держим «ПОБЕДА/ПОРАЖЕНИЕ» ровно RESULT_DISPLAY_MS от показа
+                    const elapsed = Date.now() - resultShownAt;
+                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
+                    if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
                     await importArenaHistoryFromServer(1);
                 } catch (e) {
                     console.warn(LOG, 'фоновый расчёт ГА ошибка:', e);
@@ -1910,29 +1885,17 @@ function ensureSquareButtonStyle() {
     st.textContent = `
         .PopUp_btnGap.fixedSquare {
             flex: 0 0 auto !important;
-            width: 40px !important;
-            min-width: 40px !important;
-            max-width: 40px !important;
+            width: 40px !important; min-width: 40px !important; max-width: 40px !important;
             height: 40px !important;
-            padding-left: 2px !important;
-            padding-right: 2px !important;
+            padding-left: 2px !important; padding-right: 2px !important;
             box-sizing: border-box !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
         }
         .PopUp_btnGap.fixedSquare .PopUp_btnPlate {
-            min-width: 0 !important;
-            width: 100% !important;
-            height: 100% !important;
-            padding: 0 !important;
-            font-size: 18px !important;
-            line-height: 1 !important;
-            overflow: visible !important;
-            box-sizing: border-box !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
+            min-width: 0 !important; width: 100% !important; height: 100% !important;
+            padding: 0 !important; font-size: 18px !important; line-height: 1 !important;
+            overflow: visible !important; box-sizing: border-box !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
         }
     `;
     document.head.appendChild(st);
@@ -1942,34 +1905,11 @@ function ensureFriendBtnStyle() {
         const st = document.createElement('style');
         st.id = 'hwh-arena-friend-btns';
         st.textContent = `
-        .PopUp_blocks > .PopUp_btnSocket:has(.arenaFriendBtn) {
-            align-self: stretch;
-            width: 100%;
-            box-sizing: border-box;
-            padding: 4px 6px 6px 6px;
-        }
-        .PopUp_blocks > .PopUp_btnSocket > .PopUp_btnRow {
-            width: 100%;
-            box-sizing: border-box;
-            gap: 4px;
-        }
-        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn {
-            flex: 1 1 0;
-            min-width: 0;
-            box-sizing: border-box;
-            padding-left: 0;
-            padding-right: 0;
-        }
-        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate {
-            width: 100%;
-            min-width: 0;
-            box-sizing: border-box;
-            padding-left: 4px;
-            padding-right: 4px;
-            font-size: 14px;
-            white-space: nowrap;
-        }
-    `;
+        .PopUp_blocks > .PopUp_btnSocket:has(.arenaFriendBtn) { align-self: stretch; width: 100%; box-sizing: border-box; padding: 4px 6px 6px 6px; }
+        .PopUp_blocks > .PopUp_btnSocket > .PopUp_btnRow { width: 100%; box-sizing: border-box; gap: 4px; }
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn { flex: 1 1 0; min-width: 0; box-sizing: border-box; padding-left: 0; padding-right: 0; }
+        .PopUp_btnRow .PopUp_btnGap.arenaFriendBtn .PopUp_btnPlate { width: 100%; min-width: 0; box-sizing: border-box; padding-left: 4px; padding-right: 4px; font-size: 14px; white-space: nowrap; }
+        `;
         document.head.appendChild(st);
     }
 }
@@ -2059,7 +1999,7 @@ const retryTimer = setInterval(() => {
 
 try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
 
-/* ===== АВТОСТАРТ АВТОСМЕНЫ ГА С РЕТРАЯМИ ===== */
+/* ===== АВТОСТАРТ АВТОСМЕНЫ ГА ===== */
 (function scheduleGrandShuffleAutoStart() {
     const START_DELAY_MS = 30000;
     const RETRY_MS = 1000;
@@ -2075,17 +2015,11 @@ try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
             }
             const sm = HWHClasses?.ScriptMenu?.getInst?.();
             if (!sm?.status) {
-                if (attempts < MAX_RETRIES) {
-                    setTimeout(tryStart, RETRY_MS);
-                } else {
-                    console.warn(LOG, 'ГА-автостарт: HWH-меню не готово после', MAX_RETRIES, 'попыток');
-                }
+                if (attempts < MAX_RETRIES) setTimeout(tryStart, RETRY_MS);
+                else console.warn(LOG, 'ГА-автостарт: HWH-меню не готово после', MAX_RETRIES, 'попыток');
                 return;
             }
-            if (grandShuffleEnabled) {
-                console.log(LOG, 'ГА-автостарт: уже запущено');
-                return;
-            }
+            if (grandShuffleEnabled) { console.log(LOG, 'ГА-автостарт: уже запущено'); return; }
             console.log(LOG, 'ГА-автостарт: запуск');
             startGrandShuffle();
         } catch (e) {
