@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.20
+// @version      4.25
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666 with AI
@@ -19,6 +19,8 @@
 // @downloadURL  https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
+
+
 (async function () {
 'use strict';
 
@@ -33,14 +35,28 @@ const DB_NAME_GRAND = 'HWHOneArenaBattle_Grand';
 const DB_STORE_GRAND = 'grandBattles';
 const MAX_AGE_MS = 120 * 24 * 3600 * 1000;
 const PRUNE_KEY = 'HWHOneArenaBattle.lastPrune';
-const SIM_COUNT = 10;
+
+const SIM_COUNT_LIVE = 10;              // для одиночного боя (пост-фактум) — как было
+const SIM_COUNT_IMPORT = 5;             // для импорта истории — вдвое меньше Calc-вызовов
+const IMPORT_REPLAY_DELAY_MS = 100;     // пауза между реплеями, чтобы UI дышал
+const IMPORT_TIMEOUT_MS = 30000;        // общий таймаут импорта по умолчанию
 const MIN_PROBABILITY_DEFAULT = 0.5;
 let MIN_PROBABILITY_TO_SAVE = MIN_PROBABILITY_DEFAULT;
 
-const SEEN_REPLAYS_KEY = 'HWHOneArenaBattle.seenReplays';
-const SEEN_REPLAYS_MAX = 500;
+// seenReplays -> IndexedDB
+const SEEN_REPLAYS_DB = 'HWHOneArenaBattle_Meta';
+const SEEN_REPLAYS_STORE = 'seenReplays';
+const SEEN_REPLAYS_LEGACY_KEY = 'HWHOneArenaBattle.seenReplays';
+const SEEN_REPLAYS_MIGRATED_KEY = 'HWHOneArenaBattle.seenReplaysMigrated';
+const SEEN_REPLAYS_PRUNE_KEY = 'HWHOneArenaBattle.seenReplaysLastPrune';
+const SEEN_REPLAYS_MAX_AGE_MS = 180 * 24 * 3600 * 1000;
+
+// dedup battles DB
+const DEDUP_KEY_PREFIX = 'HWHOneArenaBattle.dedup.v1.';
+const DEDUP_TIMEOUT_MS = 15000;
+
 const FRIENDLY_PLAYERS_SLOTS = 7;
-const SEARCH_MAX_ITER = 50;
+const SEARCH_MAX_ITER = 25;
 const SEARCH_FALLBACK_ITER = 10;
 const SEARCH_RETRY_DELAY_MS = 500;
 const RESULT_DISPLAY_MS = 2000;
@@ -134,8 +150,13 @@ const defaultSettings = {
 };
 
 function loadSettings() {
-    try { return { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
-    catch (e) { return { ...defaultSettings }; }
+    try {
+        const s = { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+        delete s.gameDayResetHourMsk;
+        delete s.gameTzOffset;
+        delete s.gameDayResetHourLocal;
+        return s;
+    } catch (e) { return { ...defaultSettings }; }
 }
 function saveSettings(s) {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) {}
@@ -170,24 +191,241 @@ function saveFriendlyPlayers(arr) {
     } catch (e) {}
 }
 
-function loadSeenReplays() {
-    try {
-        const raw = localStorage.getItem(SEEN_REPLAYS_KEY);
-        if (!raw) return new Set();
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) return new Set(arr.map(String));
-    } catch (e) {}
-    return new Set();
+/* ===== Начало текущих игровых суток =====
+   Источник истины — nextServerDayTs из userGetInfo: это таймстамп СЛЕДУЮЩЕГО сброса суток,
+   уже посчитанный сервером с учётом часового пояса игрока (timeZone).
+   Начало текущих суток = nextServerDayTs - 86400.
+   Fallback: 5:00 МСК (2:00 UTC), если по какой-то причине поля нет. */
+let __tzFallbackLogged = false;
+function getGameDayStartTs(userGetInfo) {
+    const u = userGetInfo || (HWHFuncs.getUserInfo() || {});
+    const nextDayTs = Number(u.nextServerDayTs || u.nextDayTs || 0);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (Number.isFinite(nextDayTs) && nextDayTs > now + 60 && nextDayTs - now < 36 * 3600) {
+        return nextDayTs - 86400;
+    }
+
+    if (!__tzFallbackLogged) {
+        console.warn(LOG, `getGameDayStartTs: nextServerDayTs=${nextDayTs} не подходит (now=${now}), fallback 5:00 MSK`);
+        __tzFallbackLogged = true;
+    }
+
+    const todayReset = Date.UTC(
+        new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate(),
+        2, 0, 0
+    );
+    return Math.floor(((now * 1000) >= todayReset ? todayReset : todayReset - 86400000) / 1000);
 }
-function saveSeenReplays(set) {
+
+async function hasAttacksTodayFromServer(kind, userGetInfo) {
+    const type = kind === 'arena' ? 'arena' : 'grand';
+    const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
+    if (!myUserId) return false;
+
+    const startOfDay = getGameDayStartTs(userGetInfo);
+
     try {
-        const arr = [...set].slice(-SEEN_REPLAYS_MAX);
-        localStorage.setItem(SEEN_REPLAYS_KEY, JSON.stringify(arr));
+        const resp = await Caller.send({ name: 'battleGetByType', args: { type, limit: 20, offset: 0 } });
+        const replays = resp?.replays || [];
+        for (const replay of replays) {
+            if (String(replay.userId) !== myUserId) continue;
+            const ts = +replay.startTime || 0;
+            if (ts >= startOfDay) return true;
+        }
+        return false;
     } catch (e) {
-        console.warn(LOG, 'не удалось сохранить seenReplays:', e);
+        console.warn(LOG, `проверка сегодняшних боёв ${kind}: ошибка`, e);
+        return false;
     }
 }
 
+async function hadAttacksToday(userGetInfo, kind) {
+    const tries = getTries(userGetInfo, kind);
+    if (tries < 0) return false;
+    if (tries < REFILL[kind].maxTries) return true;
+
+    const attacked = await hasAttacksTodayFromServer(kind, userGetInfo);
+    console.log(LOG, `${REFILL[kind].label}: попыток ${tries}/${REFILL[kind].maxTries} — проверка журнала: ${attacked ? 'атаки сегодня были' : 'атак сегодня не было'}`);
+    return attacked;
+}
+
+/* ===== seenReplays (IndexedDB) ===== */
+async function seenReplaysOpen() {
+    if (!HWHClasses.Database) throw new Error('HWHClasses.Database недоступен');
+    const db = new HWHClasses.Database(SEEN_REPLAYS_DB, SEEN_REPLAYS_STORE);
+    await db.open();
+    return db;
+}
+
+async function seenReplaysGetAllMap() {
+    if (!HWHClasses.Database) return new Map();
+    try {
+        const db = await seenReplaysOpen();
+        const all = await new Promise((resolve) => {
+            const tx = db.db.transaction([SEEN_REPLAYS_STORE], 'readonly');
+            const req = tx.objectStore(SEEN_REPLAYS_STORE).getAll();
+            req.onerror = () => resolve([]);
+            req.onsuccess = () => resolve(req.result || []);
+        });
+        return new Map(all.map(r => [String(r.replayId), r]));
+    } catch (e) {
+        console.warn(LOG, 'seenReplaysGetAllMap ошибка:', e);
+        return new Map();
+    }
+}
+
+async function seenReplaysPut(record) {
+    if (!HWHClasses.Database) return;
+    try {
+        const db = await seenReplaysOpen();
+        await db.set(String(record.replayId), record);
+    } catch (e) {
+        console.warn(LOG, 'seenReplaysPut ошибка:', e);
+    }
+}
+
+async function seenReplaysPruneIfNeeded() {
+    if (!HWHClasses.Database) return;
+    const last = parseInt(localStorage.getItem(SEEN_REPLAYS_PRUNE_KEY) || '0');
+    if (Date.now() - last < 24 * 3600 * 1000) return;
+    try {
+        const db = await seenReplaysOpen();
+        const now = Date.now();
+        const cutoff = now - SEEN_REPLAYS_MAX_AGE_MS;
+        let removed = 0;
+        await new Promise((resolve) => {
+            const tx = db.db.transaction([SEEN_REPLAYS_STORE], 'readwrite');
+            const store = tx.objectStore(SEEN_REPLAYS_STORE);
+            const req = store.openCursor();
+            req.onerror = () => resolve();
+            req.onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    const r = cursor.value;
+                    if (r.ts && r.ts > 0 && r.ts < cutoff) { cursor.delete(); removed++; }
+                    cursor.continue();
+                } else resolve();
+            };
+        });
+        localStorage.setItem(SEEN_REPLAYS_PRUNE_KEY, String(now));
+        if (removed) console.log(LOG, `seenReplays: удалено ${removed} старых (>180 дн.)`);
+    } catch (e) {
+        console.warn(LOG, 'seenReplaysPrune ошибка:', e);
+    }
+}
+
+async function migrateSeenReplaysFromLocalStorage() {
+    if (localStorage.getItem(SEEN_REPLAYS_MIGRATED_KEY) === '1') return;
+    if (!HWHClasses.Database) return;
+
+    try {
+        const raw = localStorage.getItem(SEEN_REPLAYS_LEGACY_KEY);
+        if (!raw) {
+            localStorage.setItem(SEEN_REPLAYS_MIGRATED_KEY, '1');
+            return;
+        }
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr) || !arr.length) {
+            localStorage.removeItem(SEEN_REPLAYS_LEGACY_KEY);
+            localStorage.setItem(SEEN_REPLAYS_MIGRATED_KEY, '1');
+            return;
+        }
+
+        const existingIds = new Set();
+        try {
+            const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
+            await dbA.open();
+            (await dbGetAll(dbA, DB_STORE)).forEach(r => { if (r.replayId) existingIds.add(String(r.replayId)); });
+        } catch (e) {}
+        try {
+            const dbG = new HWHClasses.Database(DB_NAME_GRAND, DB_STORE_GRAND);
+            await dbG.open();
+            (await dbGetAllGrand(dbG)).forEach(r => { if (r.replayId) existingIds.add(String(r.replayId)); });
+        } catch (e) {}
+
+        const db = await seenReplaysOpen();
+        let migrated = 0, skipped = 0;
+        for (const id of arr) {
+            const rid = String(id);
+            if (existingIds.has(rid)) { skipped++; continue; }
+            await db.set(rid, { replayId: rid, ts: 0, source: 'legacy', probability: null });
+            migrated++;
+        }
+        localStorage.removeItem(SEEN_REPLAYS_LEGACY_KEY);
+        localStorage.setItem(SEEN_REPLAYS_MIGRATED_KEY, '1');
+        console.log(LOG, `миграция seenReplays: перенесено ${migrated}, уже в battles ${skipped}`);
+    } catch (e) {
+        console.warn(LOG, 'миграция seenReplays ошибка:', e);
+    }
+}
+
+/* ===== Дедупликация battles DB ===== */
+function dedupKey(store) { return DEDUP_KEY_PREFIX + store; }
+
+async function dedupBattlesIfNeeded(store, dbName) {
+    const key = dedupKey(store);
+    if (localStorage.getItem(key)) return;
+    if (!HWHClasses.Database) return;
+
+    const startTime = Date.now();
+    try {
+        const db = new HWHClasses.Database(dbName, store);
+        await db.open();
+
+        const pairs = await new Promise((resolve) => {
+            const tx = db.db.transaction([store], 'readonly');
+            const req = tx.objectStore(store).openCursor();
+            const result = [];
+            req.onerror = () => resolve(result);
+            req.onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    result.push({ key: cursor.primaryKey, value: cursor.value });
+                    cursor.continue();
+                } else resolve(result);
+            };
+        });
+
+        const groups = new Map();
+        for (const p of pairs) {
+            const rid = p.value && p.value.replayId;
+            if (!rid) continue;
+            const k = String(rid);
+            if (!groups.has(k)) groups.set(k, []);
+            groups.get(k).push(p.key);
+        }
+
+        const toDelete = [];
+        for (const keys of groups.values()) {
+            for (let i = 1; i < keys.length; i++) toDelete.push(keys[i]);
+        }
+
+        if (!toDelete.length) {
+            console.log(LOG, `dedup ${store}: дублей нет (записей ${pairs.length})`);
+            localStorage.setItem(key, String(Date.now()));
+            return;
+        }
+
+        let deleted = 0;
+        let timedOut = false;
+        for (const k of toDelete) {
+            if (Date.now() - startTime > DEDUP_TIMEOUT_MS) { timedOut = true; break; }
+            try { await db.delete(k); deleted++; } catch (e) {}
+        }
+
+        if (timedOut) {
+            console.log(LOG, `dedup ${store}: ТАЙМАУТ, удалено ${deleted}/${toDelete.length} — продолжим позже`);
+        } else {
+            console.log(LOG, `dedup ${store}: удалено ${deleted} дублей (всего ${pairs.length} записей, ${groups.size} уникальных)`);
+            localStorage.setItem(key, String(Date.now()));
+        }
+    } catch (e) {
+        console.warn(LOG, `dedup ${store} ошибка:`, e);
+    }
+}
+
+/* ===== Остальное ===== */
 async function fetchAllClansFromServer() {
     const result = {};
     for (const league of [1, 2, 3, 4]) {
@@ -215,6 +453,7 @@ async function getAllClansCached(forceRefresh = false) {
     return data;
 }
 
+/* ===== Диалог настроек ===== */
 async function openSettingsDialog() {
     const s = loadSettings();
     const result = await HWHFuncs.popup.confirm(
@@ -278,9 +517,19 @@ async function openSettingsDialog() {
         if (val) {
             const n = Number.parseInt(val, 10);
             if (Number.isFinite(n) && n >= 0 && n <= 100) {
-                tmp.minWinProbability = n / 100;
+                const oldProb = Number(tmp.minWinProbability ?? MIN_PROBABILITY_DEFAULT);
+                const newProb = n / 100;
+                tmp.minWinProbability = newProb;
                 saveSettings(tmp);
                 applyMinProbabilityFromSettings();
+
+                if (newProb < oldProb) {
+                    console.log(LOG, `порог уменьшен (${Math.round(oldProb * 100)}% → ${n}%) — новые бои будут искаться по новому порогу`);
+                    console.log(LOG, `старые записи подтянутся автоматически после следующих боёв (или вручную через 📚 История -> 🔄 Загрузить)`);
+                } else if (newProb > oldProb) {
+                    console.log(LOG, `порог увеличен (${Math.round(oldProb * 100)}% → ${n}%) — старые записи остаются (просто не используются)`);
+                }
+
                 HWHFuncs.setProgress(`Порог вероятности: ${n}%`, 3000);
             } else {
                 HWHFuncs.setProgress('Порог должен быть 0–100%', 4000);
@@ -419,12 +668,10 @@ async function openFriendlyPlayersDialog() {
 
 function isEnemyAllowed(enemy, myClanId, noAttackFriendly) {
     const settings = loadSettings();
-
     const uid = enemy?.userId != null ? String(enemy.userId) : '';
     if (uid && settings.noAttackFriendlyPlayers !== false && loadFriendlyPlayers().includes(uid)) {
         return false;
     }
-
     const cid = enemy?.user?.clanId ? String(enemy.user.clanId) : '';
     if (!cid) return true;
     if (cid === String(myClanId)) return false;
@@ -460,12 +707,7 @@ function getBannersFromGame() {
                 if (rank < 6) colorCounts[rank]++;
                 colorNames.push(c);
             }
-            list.push({
-                id, name,
-                slotsCount: slotKeys.length,
-                colorCounts, colorNames,
-                owned: !!xudD?.[id],
-            });
+            list.push({ id, name, slotsCount: slotKeys.length, colorCounts, colorNames, owned: !!xudD?.[id] });
         }
         return list;
     } catch (e) {
@@ -501,24 +743,29 @@ function getTries(userGetInfo, kind) {
     const r = getRefill(userGetInfo, REFILL[kind].battle);
     return r ? (r.amount | 0) : -1;
 }
-function hadAttacksToday(userGetInfo, kind) {
-    const tries = getTries(userGetInfo, kind);
-    if (tries < 0) return false;
-    return tries < REFILL[kind].maxTries;
-}
 
 function handleRefillError(e, kind) {
     const msg = String(e?.message || e);
     const ref = REFILL[kind];
     const m = msg.match(/Refillable (\d+).*delta (\d+)/);
     if (m) {
-        const [, refillId, delta] = m;
-        let label = `Refillable ${refillId}`;
-        if (refillId === String(REFILL.arena.cooldown)) label = 'Арена';
-        else if (refillId === String(REFILL.grandArena.cooldown)) label = 'Гранд-Арена';
-        console.log(LOG, `${label}: кулдаун ${delta} сек`);
-        HWHFuncs.setProgress(`${label}: подожди ${delta} сек`, 5000);
-        return true;
+        const ridNum = Number(m[1]);
+        const delta = m[2];
+
+        if (ridNum === REFILL.arena.cooldown) {
+            console.log(LOG, `Арена: кулдаун ${delta} сек`);
+            HWHFuncs.setProgress(`Арена: подожди ${delta} сек`, 5000);
+            return true;
+        }
+        if (ridNum === REFILL.grandArena.cooldown) {
+            console.log(LOG, `Гранд-Арена: кулдаун ${delta} сек`);
+            HWHFuncs.setProgress(`Гранд-Арена: подожди ${delta} сек`, 5000);
+            return true;
+        }
+
+        // Refillable не из нашей области — пробрасываем, чтобы caller показал реальную ошибку
+        console.log(LOG, `Refillable ${ridNum}: кулдаун ${delta} сек — не ${ref.label}, пробрасываю`);
+        return false;
     }
     if (msg.includes('NotEnough') && msg.includes('Refillable ' + String(ref.battle))) {
         console.log(LOG, `${ref.label}: нет попыток`);
@@ -571,7 +818,7 @@ function reportBattleResult(result, label, kind) {
     }
 }
 
-async function calcProbability(battle, N = SIM_COUNT) {
+async function calcProbability(battle, N = SIM_COUNT_LIVE, yieldMs = 100) {
     if (!battle || typeof Calc !== 'function') return null;
     let wins = 0, total = 0;
     for (let i = 0; i < N; i++) {
@@ -585,7 +832,7 @@ async function calcProbability(battle, N = SIM_COUNT) {
         } catch (e) {
             console.warn(LOG, `симуляция ${i + 1}/${N} упала:`, e.message);
         }
-        await new Promise(r => setTimeout(r, 20));
+        await new Promise(r => setTimeout(r, yieldMs));
     }
     if (total === 0) return null;
     return wins / total;
@@ -603,9 +850,7 @@ async function dbGetAll(myDb, store = DB_STORE) {
         req.onsuccess = () => resolve(req.result || []);
     });
 }
-async function dbGetAllGrand(myDb) {
-    return dbGetAll(myDb, DB_STORE_GRAND);
-}
+async function dbGetAllGrand(myDb) { return dbGetAll(myDb, DB_STORE_GRAND); }
 async function dbGetAllKeys(myDb, store = DB_STORE) {
     return new Promise((resolve) => {
         const tx = myDb.db.transaction([store], 'readonly');
@@ -656,24 +901,7 @@ async function saveBattleToDB(record, store = DB_STORE) {
         console.warn(LOG, 'не удалось сохранить бой:', e);
     }
 }
-async function saveGrandBattleToDB(record) {
-    return saveBattleToDB(record, DB_STORE_GRAND);
-}
-
-async function hasAnyHistoryAtOrAboveThreshold(kind) {
-    if (!HWHClasses.Database) return false;
-    try {
-        const isGrand = kind === 'grandArena';
-        const store = isGrand ? DB_STORE_GRAND : DB_STORE;
-        const dbName = isGrand ? DB_NAME_GRAND : DB_NAME;
-        const db = new HWHClasses.Database(dbName, store);
-        await db.open();
-        const all = isGrand ? await dbGetAllGrand(db) : await dbGetAll(db);
-        return all.some(r => typeof r.probability === 'number' && r.probability >= MIN_PROBABILITY_TO_SAVE);
-    } catch (e) {
-        return false;
-    }
-}
+async function saveGrandBattleToDB(record) { return saveBattleToDB(record, DB_STORE_GRAND); }
 
 function extractPackFromTeam(teamObj) {
     const units = Object.values(teamObj || {}).filter(u => u && u.id);
@@ -688,7 +916,6 @@ function extractPackFromTeam(teamObj) {
 
 function convertReplayToRecords(replay, myUserId, source) {
     if (String(replay.userId) !== String(myUserId)) return null;
-
     const ts = (+replay.startTime || Math.floor(Date.now() / 1000)) * 1000;
     const base = {
         ts,
@@ -708,17 +935,11 @@ function convertReplayToRecords(replay, myUserId, source) {
         if (!atk.heroes.length) return null;
         return [{
             ...base,
-            attackerPack: atk.heroes,
-            attackerPet: atk.pet,
-            attackerFavor: atk.favor,
-            defenderPack: def.heroes,
-            defenderPet: def.pet,
-            defenderFavor: def.favor,
-            win: !!replay.result?.win,
-            probability: null,
+            attackerPack: atk.heroes, attackerPet: atk.pet, attackerFavor: atk.favor,
+            defenderPack: def.heroes, defenderPet: def.pet, defenderFavor: def.favor,
+            win: !!replay.result?.win, probability: null,
         }];
     }
-
     if (source === 'grandArena') {
         const defArr = Array.isArray(replay.defenders) ? replay.defenders : [replay.defenders];
         const atk = extractPackFromTeam(replay.attackers || {});
@@ -726,54 +947,45 @@ function convertReplayToRecords(replay, myUserId, source) {
         if (!atk.heroes.length) return null;
         return [{
             ...base,
-            attackerPack: atk.heroes,
-            attackerPet: atk.pet,
-            attackerFavor: atk.favor,
-            defenderPack: def.heroes,
-            defenderPet: def.pet,
-            defenderFavor: def.favor,
-            win: !!replay.result?.win,
-            probability: null,
+            attackerPack: atk.heroes, attackerPet: atk.pet, attackerFavor: atk.favor,
+            defenderPack: def.heroes, defenderPet: def.pet, defenderFavor: def.favor,
+            win: !!replay.result?.win, probability: null,
             battleOrder: replay.result?.battleOrder ?? 0,
         }];
     }
-
     return null;
 }
 
-async function calcProbabilityForReplay(replay) {
+async function calcProbabilityForReplay(replay, N = SIM_COUNT_LIVE) {
     try {
         const battle = structuredClone(replay);
         if (!battle.progress || !battle.progress.length) {
             battle.progress = [{ attackers: { input: ['auto', 0, 0, 'auto', 0, 0] } }];
         }
         if (!battle.type) battle.type = 'arena';
-        return await calcProbability(battle, SIM_COUNT);
+        return await calcProbability(battle, N);
     } catch (e) {
         console.warn(LOG, 'calcProbabilityForReplay ошибка:', e.message);
         return null;
     }
 }
 
-async function importArenaHistoryFromServer(maxPages = Infinity) {
-    if (!HWHClasses.Database) {
-        console.log(LOG, 'импорт: HWHClasses.Database недоступен');
-        return 0;
-    }
+/* ===== Импорт истории ===== */
+async function importArenaHistoryFromServer(maxPages = Infinity, timeoutMs = IMPORT_TIMEOUT_MS, silent = false) {
+    if (!HWHClasses.Database) { console.log(LOG, 'импорт: HWHClasses.Database недоступен'); return 0; }
     const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
-    if (!myUserId) {
-        console.log(LOG, 'импорт истории: нет userInfo.id');
-        HWHFuncs.setProgress('История: нет userInfo.id', 4000);
-        return 0;
-    }
+    if (!myUserId) { console.log(LOG, 'импорт истории: нет userInfo.id'); return 0; }
 
-    const seenReplays = loadSeenReplays();
+    await migrateSeenReplaysFromLocalStorage();
+    await dedupBattlesIfNeeded(DB_STORE, DB_NAME);
+    await dedupBattlesIfNeeded(DB_STORE_GRAND, DB_NAME_GRAND);
+
+    const seenMap = await seenReplaysGetAllMap();
+    console.log(LOG, `seenReplays: ${seenMap.size} записей`);
 
     const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
     await dbA.open();
-    const existingIds = new Set(
-        (await dbGetAll(dbA, DB_STORE)).map(r => String(r.replayId)).filter(Boolean)
-    );
+    const existingIds = new Set((await dbGetAll(dbA, DB_STORE)).map(r => String(r.replayId)).filter(Boolean));
     try {
         const dbG = new HWHClasses.Database(DB_NAME_GRAND, DB_STORE_GRAND);
         await dbG.open();
@@ -781,137 +993,123 @@ async function importArenaHistoryFromServer(maxPages = Infinity) {
     } catch (e) {}
 
     const LIMIT = 20;
+    const deadline = Date.now() + timeoutMs;
+    let timedOut = false;
+
     let totalImported = 0;
     let totalSkippedLowProb = 0;
     let totalDuplicates = 0;
     let totalForeign = 0;
-    let totalSeen = 0;
-    let totalProcessed = 0;
+    let totalReimported = 0;
+    let totalSimulated = 0;
 
-    console.log(LOG, `=== Импорт истории (myUserId=${myUserId}) ===`);
+    console.log(LOG, `=== Импорт истории (myUserId=${myUserId}, timeout=${timeoutMs/1000}с) ===`);
 
     for (const source of ['arena', 'grandArena']) {
+        if (timedOut) break;
         const type = source === 'arena' ? 'arena' : 'grand';
         let offset = 0;
         let page = 0;
         let srcImported = 0;
-        let srcSeen = 0;
         let srcSkippedProb = 0;
         let srcDuplicates = 0;
         let srcForeign = 0;
-
-        console.log(LOG, `--- источник: ${source} (type=${type}) ---`);
+        let srcReimported = 0;
+        let srcSimulated = 0;
 
         while (page < maxPages) {
+            if (Date.now() > deadline) { timedOut = true; break; }
             page++;
             let resp;
             try {
-                resp = await Caller.send({
-                    name: 'battleGetByType',
-                    args: { type, limit: LIMIT, offset },
-                });
+                resp = await Caller.send({ name: 'battleGetByType', args: { type, limit: LIMIT, offset } });
             } catch (e) {
                 const msg = String(e?.message || e);
                 console.warn(LOG, `battleGetByType(${type}) стр.${page} ошибка:`, msg);
-                HWHFuncs.setProgress(`История ${source}: ошибка — ${msg}`, 5000);
                 break;
             }
 
             const replays = resp?.replays || [];
-            console.log(LOG, `${source} стр.${page}: получено ${replays.length} реплеев`);
             if (!replays.length) break;
 
-            const fresh = [];
-            let pageDuplicates = 0;
-            let pageSeen = 0;
-            let pageForeign = 0;
-
+            let pageNew = 0;
             for (const replay of replays) {
+                if (Date.now() > deadline) { timedOut = true; break; }
+
                 const rid = String(replay.id);
-                if (existingIds.has(rid)) { pageDuplicates++; totalDuplicates++; srcDuplicates++; continue; }
-                if (seenReplays.has(rid)) { pageSeen++; totalSeen++; srcSeen++; continue; }
-                if (String(replay.userId) !== myUserId) { pageForeign++; totalForeign++; srcForeign++; continue; }
-                fresh.push(replay);
-            }
 
-            console.log(
-                LOG,
-                `${source} стр.${page}: новых ${fresh.length} ` +
-                `(дублей ${pageDuplicates}, уже считалось ${pageSeen}, не моих ${pageForeign})`
-            );
-
-            if (!fresh.length) {
-                HWHFuncs.setProgress(
-                    `История ${source}: стр.${page} — новых нет (дублей ${pageDuplicates}, считалось ${pageSeen}, чужих ${pageForeign})`,
-                    false
-                );
-                if (replays.length < LIMIT) break;
-                offset += LIMIT;
-                await new Promise(r => setTimeout(r, 200));
-                continue;
-            }
-
-            const total = fresh.length;
-            let idx = 0;
-
-            for (const replay of fresh) {
-                idx++;
-                const replayIdStr = String(replay.id);
-                const prefix = `История ${source} [${idx}/${total}]:`;
+                if (existingIds.has(rid)) { srcDuplicates++; totalDuplicates++; continue; }
+                if (String(replay.userId) !== myUserId) { srcForeign++; totalForeign++; continue; }
 
                 const records = convertReplayToRecords(replay, myUserId, source);
-                if (!records) {
-                    totalForeign++;
-                    srcForeign++;
-                    pushLiveStatus(`${prefix} не моя атака`);
-                    continue;
-                }
+                if (!records) { srcForeign++; totalForeign++; continue; }
+                pageNew++;
 
-                startLiveStatus(`${prefix} расчёт вероятности`);
-                const prob = await calcProbabilityForReplay(replay);
+                const seen = seenMap.get(rid);
+                let prob = null;
 
-                if (prob !== null && prob < MIN_PROBABILITY_TO_SAVE) {
-                    totalSkippedLowProb++;
-                    srcSkippedProb++;
-                    seenReplays.add(replayIdStr);
-                    stopLiveStatus(`${prefix} ${(prob * 100).toFixed(0)}% — пропуск (< ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%)`);
-                    console.log(LOG, `импорт: пропущен replayId=${replay.id} — probability ${(prob * 100).toFixed(0)}% < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
-                    continue;
+                if (seen && typeof seen.probability === 'number') {
+                    prob = seen.probability;
+                    if (prob < MIN_PROBABILITY_TO_SAVE) {
+                        await seenReplaysPut({ replayId: rid, ts: Date.now(), source, probability: prob });
+                        seenMap.set(rid, { replayId: rid, ts: Date.now(), source, probability: prob });
+                        srcSkippedProb++; totalSkippedLowProb++;
+                        await new Promise(r => setTimeout(r, IMPORT_REPLAY_DELAY_MS));
+                        continue;
+                    }
+                    srcReimported++; totalReimported++;
+                    console.log(LOG, `импорт: ре-импорт replayId=${rid} с сохранённой prob ${(prob * 100).toFixed(0)}% (без ре-симуляции)`);
+                    await new Promise(r => setTimeout(r, IMPORT_REPLAY_DELAY_MS));
+                } else {
+                    console.log(LOG, `История ${source}: расчёт replayId=${rid}...`);
+                    // Используем SIM_COUNT_IMPORT (5) и yield 100мс по умолчанию
+                    prob = await calcProbabilityForReplay(replay, SIM_COUNT_IMPORT);
+                    console.log(LOG, `История ${source}: replayId=${rid} — ${prob !== null ? (prob * 100).toFixed(0) + '%' : 'н/д'}`);
+
+                    if (prob !== null && prob < MIN_PROBABILITY_TO_SAVE) {
+                        await seenReplaysPut({ replayId: rid, ts: Date.now(), source, probability: prob });
+                        seenMap.set(rid, { replayId: rid, ts: Date.now(), source, probability: prob });
+                        srcSkippedProb++; totalSkippedLowProb++;
+                        console.log(LOG, `импорт: пропущен replayId=${rid} — ${(prob * 100).toFixed(0)}% < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
+                        await new Promise(r => setTimeout(r, IMPORT_REPLAY_DELAY_MS));
+                        continue;
+                    }
+                    srcSimulated++; totalSimulated++;
+                    await new Promise(r => setTimeout(r, IMPORT_REPLAY_DELAY_MS)); // ⬅️ пауза перед следующим
                 }
 
                 for (const rec of records) {
                     rec.probability = prob;
                     if (source === 'arena') await saveBattleToDB(rec);
                     else await saveGrandBattleToDB(rec);
-                    existingIds.add(replayIdStr);
-                    totalImported++;
-                    srcImported++;
+                    existingIds.add(rid);
+                    totalImported++; srcImported++;
                 }
-                seenReplays.add(replayIdStr);
-                totalProcessed++;
-                stopLiveStatus(`${prefix} ✓ сохранено (${(prob * 100).toFixed(0)}%)`);
+                await seenReplaysPut({ replayId: rid, ts: Date.now(), source, probability: prob });
+                seenMap.set(rid, { replayId: rid, ts: Date.now(), source, probability: prob });
             }
 
+            console.log(LOG, `${source} стр.${page}: ${replays.length} реплеев, новых ${pageNew}, дублей ${srcDuplicates}, чужих ${srcForeign}`);
+            if (timedOut) break;
             if (replays.length < LIMIT) break;
             offset += LIMIT;
             await new Promise(r => setTimeout(r, 200));
         }
 
-        console.log(
-            LOG,
-            `${source}: сохранено ${srcImported}, уже считалось ${srcSeen}, низкий шанс ${srcSkippedProb}, дублей ${srcDuplicates}, не моих ${srcForeign}`
-        );
-        HWHFuncs.setProgress(
-            `История ${source}: сохранено ${srcImported}, пропущено ${srcSeen + srcSkippedProb}`,
-            false
-        );
+        console.log(LOG, `${source}: сохранено ${srcImported} (из них без ре-симуляции ${srcReimported}), симулировано ${srcSimulated}, низкий шанс ${srcSkippedProb}, дублей ${srcDuplicates}, чужих ${srcForeign}`);
     }
 
-    saveSeenReplays(seenReplays);
+    await seenReplaysPruneIfNeeded();
 
-    const summary = `История: +${totalImported} новых, уже считалось ${totalSeen}, низкий шанс ${totalSkippedLowProb}, дублей ${totalDuplicates}, не моих ${totalForeign}`;
+    const summary = `История: +${totalImported} (без ре-сим ${totalReimported}), симулировано ${totalSimulated}, низкий шанс ${totalSkippedLowProb}, дублей ${totalDuplicates}, чужих ${totalForeign}`;
     console.log(LOG, summary);
-    HWHFuncs.setProgress(summary, 6000);
+
+    if (timedOut) {
+        console.log(LOG, `импорт прерван по таймауту (${timeoutMs / 1000} сек)`);
+        if (!silent) HWHFuncs.setProgress(`История: прервано по таймауту`, 4000);
+    } else {
+        if (!silent) HWHFuncs.setProgress(summary, 6000);
+    }
     return totalImported;
 }
 
@@ -920,27 +1118,14 @@ async function exportAllDB() {
         const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
         await dbA.open();
         const arena = await dbGetAll(dbA, DB_STORE);
-
         let grand = [];
         try {
             const dbG = new HWHClasses.Database(DB_NAME_GRAND, DB_STORE_GRAND);
             await dbG.open();
             grand = await dbGetAllGrand(dbG);
         } catch (e) {}
-
-        if (!arena.length && !grand.length) {
-            HWHFuncs.setProgress('БД пуста', 3000);
-            return;
-        }
-
-        const payload = {
-            version: 2,
-            exportedAt: new Date().toISOString(),
-            scriptVersion: GM_info.script.version,
-            arena,
-            grand,
-        };
-
+        if (!arena.length && !grand.length) { HWHFuncs.setProgress('БД пуста', 3000); return; }
+        const payload = { version: 2, exportedAt: new Date().toISOString(), scriptVersion: GM_info.script.version, arena, grand };
         const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -969,19 +1154,12 @@ async function importAllDB() {
         if (!file) return;
         try {
             const data = JSON.parse(await file.text());
-            let arenaRecords = [];
-            let grandRecords = [];
-
+            let arenaRecords = [], grandRecords = [];
             if (data.arena || data.grand) {
-                arenaRecords = data.arena || [];
-                grandRecords = data.grand || [];
-            } else if (Array.isArray(data.records)) {
-                arenaRecords = data.records;
-            } else if (Array.isArray(data)) {
-                arenaRecords = data;
-            } else {
-                throw new Error('Неизвестный формат файла');
-            }
+                arenaRecords = data.arena || []; grandRecords = data.grand || [];
+            } else if (Array.isArray(data.records)) arenaRecords = data.records;
+            else if (Array.isArray(data)) arenaRecords = data;
+            else throw new Error('Неизвестный формат файла');
 
             const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
             await dbA.open();
@@ -1008,12 +1186,15 @@ async function importAllDB() {
                         if (rec.replayId) existingG.add(String(rec.replayId));
                         addedG++;
                     }
-                } catch (e) {
-                    console.warn(LOG, 'импорт ГА ошибка:', e);
-                }
+                } catch (e) { console.warn(LOG, 'импорт ГА ошибка:', e); }
             }
 
-            console.log(LOG, `импорт БД: Арена +${addedA} (проп. ${skippedA}), ГА +${addedG} (проп. ${skippedG})`);
+            try {
+                localStorage.removeItem(dedupKey(DB_STORE));
+                localStorage.removeItem(dedupKey(DB_STORE_GRAND));
+            } catch (e) {}
+
+            console.log(LOG, `импорт БД: Арена +${addedA} (проп. ${skippedA}), ГА +${addedG} (проп. ${skippedG}), ключи dedup сброшены`);
             HWHFuncs.setProgress(`Импорт: Арена +${addedA}, ГА +${addedG}`, 5000);
         } catch (err) {
             console.error(LOG, 'импорт БД ошибка:', err);
@@ -1028,10 +1209,7 @@ async function openHistoryDialog() {
     if (!loadSettings().saveHistory) {
         const go = await HWHFuncs.popup.confirm(
             'Сохранение истории боёв отключено в настройках.<br>Открыть историю всё равно?',
-            [
-                { msg: 'Открыть', result: true, color: 'green' },
-                { msg: 'Отмена', result: false, isCancel: true, color: 'red' },
-            ]
+            [{ msg: 'Открыть', result: true, color: 'green' }, { msg: 'Отмена', result: false, isCancel: true, color: 'red' }]
         );
         if (!go) return;
     }
@@ -1046,7 +1224,7 @@ async function openHistoryDialog() {
     );
     if (result === 'export') await exportAllDB();
     else if (result === 'import') await importAllDB();
-    else if (result === 'server') await importArenaHistoryFromServer();
+    else if (result === 'server') await importArenaHistoryFromServer(Infinity, 300000, false);
 }
 
 function packSimilarity(a, b) {
@@ -1064,18 +1242,13 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
         const all = await dbGetAll(myDb);
 
         const targetKey = packKey(defenderHeroes, defenderPet);
-
         const hasDefenderFavor = (r) => {
             const f = r.defenderFavor;
             if (!f || typeof f !== 'object') return false;
             return Object.keys(f).some(k => f[k] != null);
         };
 
-        const exact = all.filter(r =>
-            hasDefenderFavor(r) &&
-            packKey(r.defenderPack, r.defenderPet) === targetKey
-        );
-
+        const exact = all.filter(r => hasDefenderFavor(r) && packKey(r.defenderPack, r.defenderPet) === targetKey);
         let fuzzy = [];
         if (!exact.length) {
             fuzzy = all.filter(r => {
@@ -1089,7 +1262,6 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
                 console.log(LOG, `точного совпадения нет — ищем по похожим защитам (${fuzzy.length} записей)`);
             }
         }
-
         const source = exact.length ? exact : fuzzy;
         if (!source.length) return [];
 
@@ -1098,34 +1270,21 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
             const akey = packKey(r.attackerPack, r.attackerPet);
             if (!byAttacker.has(akey)) {
                 byAttacker.set(akey, {
-                    attackerPack: r.attackerPack,
-                    attackerPet: r.attackerPet,
+                    attackerPack: r.attackerPack, attackerPet: r.attackerPet,
                     attackerFavor: r.attackerFavor || {},
-                    wins: 0,
-                    total: 0,
-                    simSum: 0,
-                    simCount: 0,
-                    matched: 0,
-                    exact: 0,
+                    wins: 0, total: 0, simSum: 0, simCount: 0, matched: 0, exact: 0,
                 });
             }
             const e = byAttacker.get(akey);
             e.total++;
             if (r.win) e.wins++;
-            if (typeof r.probability === 'number') {
-                e.simSum += r.probability;
-                e.simCount++;
-            }
+            if (typeof r.probability === 'number') { e.simSum += r.probability; e.simCount++; }
             e.matched++;
             if (exact.includes(r)) e.exact++;
         }
 
         return [...byAttacker.values()]
-            .map(e => ({
-                ...e,
-                histWinRate: e.total > 0 ? e.wins / e.total : 0,
-                simProbability: e.simCount > 0 ? e.simSum / e.simCount : null,
-            }))
+            .map(e => ({ ...e, histWinRate: e.total > 0 ? e.wins / e.total : 0, simProbability: e.simCount > 0 ? e.simSum / e.simCount : null }))
             .filter(e => e.simProbability !== null && e.attackerPack?.length === 5)
             .sort((a, b) => b.simProbability - a.simProbability)
             .slice(0, topN);
@@ -1135,7 +1294,6 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
     }
 }
 
-/* === ГЛАВНАЯ ПРАВКА: pet и favor — раздельные пулы, внутрипачечная уникальность favor === */
 async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPetsArr, currentFavor) {
     if (!HWHClasses.Database) {
         console.log(LOG, 'ГА-поиск: HWHClasses.Database недоступен');
@@ -1149,184 +1307,231 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
         const dbG = new HWHClasses.Database(DB_NAME_GRAND, DB_STORE_GRAND);
         await dbG.open();
         const all = await dbGetAllGrand(dbG);
-        console.log(LOG, `ГА-поиск: записей в истории ГА = ${all.length}, видимых защит = ${enemyVisibleTeams.length}`);
+        const visibleCount = Math.min(enemyVisibleTeams.length, 3);
+        console.log(LOG, `ГА-поиск: записей в истории ГА = ${all.length}, видимых защит = ${visibleCount}, скрытых = ${3 - visibleCount}`);
         if (!all.length) {
             console.log(LOG, 'ГА-поиск: история ГА пуста');
             return null;
         }
 
-        // Хелпер: извлечь список покровителей из favor-объекта с защитой от внутренних дублей
+        const HIDDEN_PROB = 0.5;
+        const TOP_N = 7;
+
         const favorPetValues = (favor) => {
             const vals = Object.values(favor || {}).filter(Boolean).map(Number);
             const seen = new Set();
             const uniq = [];
             for (const v of vals) {
-                if (seen.has(v)) {
-                    // внутренний дубль в одной пачке — невалидная пачка, отбрасываем
-                    return { uniq: [], invalid: true };
-                }
+                if (seen.has(v)) return { uniq: [], invalid: true };
                 seen.add(v);
                 uniq.push(v);
             }
             return { uniq, invalid: false };
         };
 
-        // 1) Собираем кандидатов по каждой защите (отсортированы по вероятности)
-        const candidatesByDef = [];
-        for (let defIdx = 0; defIdx < enemyVisibleTeams.length && defIdx < 3; defIdx++) {
-            const defTeam = enemyVisibleTeams[defIdx];
-            const defHeroes = (defTeam.heroes || []).filter(h => h.id < 6000).map(h => h.id);
-            const defPet    = (defTeam.heroes || []).find(h => h.id >= 6000)?.id || null;
-            if (!defHeroes.length) {
-                console.log(LOG, `ГА-поиск: защита #${defIdx + 1} без героев, пропуск`);
-                candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: [] });
-                continue;
-            }
+        // ===== 1. Текущие пачки игрока (все 3, для всех позиций) =====
+        const currentPacks = [];
+        for (let i = 0; i < Math.min(3, currentHeroesArr.length); i++) {
+            const heroes = (currentHeroesArr[i] || []).filter(Boolean);
+            if (heroes.length !== 5) continue;
+            const pet = currentPetsArr[i] || null;
+            const favor = {};
+            for (const h of heroes) if (currentFavor?.[h]) favor[h] = currentFavor[h];
+            const fv = favorPetValues(favor);
+            if (fv.invalid) continue;
+            currentPacks.push({
+                heroes: heroes.slice().sort((a, b) => a - b),
+                pet,
+                favor,
+                favorPets: fv.uniq,
+                prob: HIDDEN_PROB,
+                source: 'current',
+                sourceIdx: i,
+                wins: 0, total: 0,
+                againstDefHeroes: null, againstDefPet: null,
+            });
+        }
 
-            const targetKey = packKey(defHeroes, defPet);
-            let source = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey);
-            if (!source.length) {
-                source = all.filter(r => {
-                    const sim = packSimilarity(r.defenderPack || [], defHeroes);
-                    if (sim < 0.8) return false;
-                    if (defPet && r.defenderPet && defPet !== r.defenderPet) return false;
-                    return true;
-                });
-            }
-            if (!source.length) {
-                console.log(LOG, `ГА-поиск: защита #${defIdx + 1} — матчей нет`);
-                candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: [] });
-                continue;
-            }
+        // ===== 2. Кандидаты по каждой позиции =====
+        const candidatesByDef = [[], [], []];
 
-            const byAtk = new Map();
-            for (const r of source) {
-                const fv = favorPetValues(r.attackerFavor);
-                if (fv.invalid) continue;   // пачка с дублями покровителей внутри — пропуск
+        for (let defIdx = 0; defIdx < 3; defIdx++) {
+            const isVisible = defIdx < visibleCount;
 
-                const atkKey = packKey(r.attackerPack, r.attackerPet);
-                if (!byAtk.has(atkKey)) {
-                    byAtk.set(atkKey, {
-                        heroes: r.attackerPack,
-                        pet: r.attackerPet,
-                        favor: r.attackerFavor || {},
-                        favorPets: fv.uniq,     // массив покровителей без дублей
-                        wins: 0, total: 0, simSum: 0, simCount: 0,
-                    });
+            if (isVisible) {
+                const defTeam = enemyVisibleTeams[defIdx];
+                const defHeroes = (defTeam.heroes || []).filter(h => h.id < 6000).map(h => h.id);
+                const defPet = (defTeam.heroes || []).find(h => h.id >= 6000)?.id || null;
+
+                if (defHeroes.length) {
+                    const targetKey = packKey(defHeroes, defPet);
+                    let source = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey);
+                    if (!source.length) {
+                        source = all.filter(r => {
+                            const sim = packSimilarity(r.defenderPack || [], defHeroes);
+                            if (sim < 0.8) return false;
+                            if (defPet && r.defenderPet && defPet !== r.defenderPet) return false;
+                            return true;
+                        });
+                    }
+
+                    const byAtk = new Map();
+                    for (const r of source) {
+                        const fv = favorPetValues(r.attackerFavor);
+                        if (fv.invalid) continue;
+                        const atkKey = packKey(r.attackerPack, r.attackerPet);
+                        if (!byAtk.has(atkKey)) {
+                            byAtk.set(atkKey, {
+                                heroes: r.attackerPack.slice().sort((a, b) => a - b),
+                                pet: r.attackerPet,
+                                favor: r.attackerFavor || {},
+                                favorPets: fv.uniq,
+                                wins: 0, total: 0, simSum: 0, simCount: 0,
+                                source: 'history',
+                                againstDefHeroes: defHeroes,
+                                againstDefPet: defPet,
+                            });
+                        }
+                        const e = byAtk.get(atkKey);
+                        e.total++;
+                        if (r.win) e.wins++;
+                        if (typeof r.probability === 'number') { e.simSum += r.probability; e.simCount++; }
+                    }
+
+                    const cands = [];
+                    for (const e of byAtk.values()) {
+                        e.prob = e.simCount > 0 ? e.simSum / e.simCount : (e.wins / e.total);
+                        cands.push(e);
+                    }
+                    cands.sort((a, b) => b.prob - a.prob);
+                    candidatesByDef[defIdx].push(...cands.slice(0, TOP_N));
                 }
-                const e = byAtk.get(atkKey);
-                e.total++;
-                if (r.win) e.wins++;
-                if (typeof r.probability === 'number') { e.simSum += r.probability; e.simCount++; }
-            }
 
-            const cands = [];
-            for (const e of byAtk.values()) {
-                e.prob = e.simCount > 0 ? e.simSum / e.simCount : (e.wins / e.total);
-                cands.push(e);
-            }
-            cands.sort((a, b) => b.prob - a.prob);
-            console.log(LOG, `ГА-поиск: защита #${defIdx + 1} — кандидатов: ${cands.length} (лучший ${cands[0] ? (cands[0].prob * 100).toFixed(0) + '%' : '—'})`);
-            candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: cands });
-        }
-
-        // 2) Жадный выбор с учётом:
-        //    - герой: 1 раз на 3 пачки
-        //    - активный пет: 1 раз на 3 пачки
-        //    - пет-покровитель: 1 раз на 3 пачки
-        //    pet и favor — РАЗНЫЕ пулы, пересечение между ними разрешено.
-        const slots = [null, null, null];
-        const usedHeroes = new Set();
-        const usedPets = new Set();          // активные петы
-        const usedFavorPets = new Set();     // покровители
-
-        for (const { defIdx, defHeroes, defPet, candidates } of candidatesByDef) {
-            let picked = null;
-            for (const c of candidates) {
-                if (c.prob < MIN_PROBABILITY_TO_SAVE) continue;
-                if ((c.heroes || []).some(h => usedHeroes.has(h))) continue;
-                if (c.pet && usedPets.has(c.pet)) continue;
-                if ((c.favorPets || []).some(fp => usedFavorPets.has(fp))) continue;
-
-                picked = { ...c, position: defIdx, againstDefHeroes: defHeroes, againstDefPet: defPet };
-                break;
-            }
-            if (picked) {
-                slots[defIdx] = picked;
-                picked.heroes.forEach(h => usedHeroes.add(h));
-                if (picked.pet) usedPets.add(picked.pet);
-                (picked.favorPets || []).forEach(fp => usedFavorPets.add(fp));
-                const favList = (picked.favorPets || []).join(',') || '—';
-                console.log(LOG, `ГА-поиск: позиция #${defIdx + 1} — [${picked.heroes.join(',')}] активный=${picked.pet || '—'} покровители=[${favList}] (${(picked.prob * 100).toFixed(0)}%)`);
+                // + все текущие пачки с prob = 0.5
+                for (const cp of currentPacks) {
+                    candidatesByDef[defIdx].push({ ...cp });
+                }
             } else {
-                console.log(LOG, `ГА-поиск: позиция #${defIdx + 1} — подходящей пачки без конфликтов нет`);
+                // Скрытая позиция: сначала текущие (prob = 0.5), потом история (тоже 0.5)
+                for (const cp of currentPacks) {
+                    candidatesByDef[defIdx].push({ ...cp });
+                }
+
+                const allByAtk = new Map();
+                for (const r of all) {
+                    const fv = favorPetValues(r.attackerFavor);
+                    if (fv.invalid) continue;
+                    const atkKey = packKey(r.attackerPack, r.attackerPet);
+                    if (!allByAtk.has(atkKey)) {
+                        allByAtk.set(atkKey, {
+                            heroes: r.attackerPack.slice().sort((a, b) => a - b),
+                            pet: r.attackerPet,
+                            favor: r.attackerFavor || {},
+                            favorPets: fv.uniq,
+                            wins: 0, total: 0, simSum: 0, simCount: 0,
+                            source: 'history',
+                            againstDefHeroes: null, againstDefPet: null,
+                        });
+                    }
+                    const e = allByAtk.get(atkKey);
+                    e.total++;
+                    if (r.win) e.wins++;
+                    if (typeof r.probability === 'number') { e.simSum += r.probability; e.simCount++; }
+                }
+                const sortedAll = [...allByAtk.values()]
+                    .map(e => ({ ...e, prob: HIDDEN_PROB })) // принудительно 0.5
+                    .sort((a, b) => (b.simCount > 0 ? b.simSum / b.simCount : 0) - (a.simCount > 0 ? a.simSum / a.simCount : 0));
+                candidatesByDef[defIdx].push(...sortedAll.slice(0, TOP_N));
             }
+
+            // Дедупликация по packKey
+            const seen = new Set();
+            const uniq = [];
+            for (const c of candidatesByDef[defIdx]) {
+                const key = packKey(c.heroes, c.pet);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                uniq.push(c);
+            }
+            candidatesByDef[defIdx] = uniq.slice(0, TOP_N * 2);
         }
 
-        const qualified = slots.filter(s => s && s.prob >= MIN_PROBABILITY_TO_SAVE);
-        if (!qualified.length) {
-            console.log(LOG, `ГА-поиск: ни одна пачка не прошла порог ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
+        console.log(LOG, `ГА-поиск: кандидатов на позицию: #1=${candidatesByDef[0].length}, #2=${candidatesByDef[1].length}, #3=${candidatesByDef[2].length}`);
+
+        if (candidatesByDef.some(c => !c.length)) {
+            console.log(LOG, 'ГА-поиск: не для всех позиций есть кандидаты');
             return null;
         }
 
-        // 3) Свободные позиции добиваем текущими пачками — тоже без конфликтов
-        for (let pos = 0; pos < 3; pos++) {
-            if (slots[pos]) continue;
-            for (let i = 0; i < currentHeroesArr.length; i++) {
-                const pack = currentHeroesArr[i];
-                if (!pack || pack.some(h => usedHeroes.has(h))) continue;
+        // ===== 3. Перебор троек =====
+        const conflicts = (a, b) => {
+            const setB = new Set(b.heroes);
+            if (a.heroes.some(h => setB.has(h))) return true;
+            if (a.pet && b.pet && a.pet === b.pet) return true;
+            const favB = new Set(b.favorPets);
+            if (a.favorPets.some(fp => favB.has(fp))) return true;
+            return false;
+        };
 
-                const pet = currentPetsArr[i] || null;
-                if (pet && usedPets.has(pet)) continue;
+        const p2of3 = (p1, p2, p3) => p1 * p2 + p1 * p3 + p2 * p3 - 2 * p1 * p2 * p3;
 
-                const favorForSlot = {};
-                for (const h of pack) if (currentFavor?.[h]) favorForSlot[h] = currentFavor[h];
-                const fv = favorPetValues(favorForSlot);
-                if (fv.invalid) continue;
-                if (fv.uniq.some(fp => usedFavorPets.has(fp))) continue;
+        let best = null;
+        let bestScore = 0;
+        let totalChecked = 0;
 
-                slots[pos] = {
-                    heroes: pack,
-                    pet,
-                    favor: favorForSlot,
-                    favorPets: fv.uniq,
-                    prob: 0,
-                    position: pos,
-                    fallback: true,
-                };
-                pack.forEach(h => usedHeroes.add(h));
-                if (pet) usedPets.add(pet);
-                fv.uniq.forEach(fp => usedFavorPets.add(fp));
-                console.log(LOG, `ГА-поиск: позиция #${pos + 1} — добивка текущей пачкой [${pack.join(',')}] активный=${pet || '—'} покровители=[${fv.uniq.join(',') || '—'}]`);
-                break;
+        for (const c0 of candidatesByDef[0]) {
+            for (const c1 of candidatesByDef[1]) {
+                if (conflicts(c0, c1)) continue;
+                for (const c2 of candidatesByDef[2]) {
+                    if (conflicts(c0, c2) || conflicts(c1, c2)) continue;
+                    totalChecked++;
+                    const score = p2of3(c0.prob, c1.prob, c2.prob);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = [c0, c1, c2];
+                    }
+                }
             }
         }
 
-        // 4) Если 3 неконфликтующие пачки собрать не удалось — возвращаем null,
-        //    чтобы атаковать всеми текущими пачками (они валидны по определению).
-        if (slots.some(s => !s)) {
-            console.log(LOG, 'ГА-поиск: не удалось собрать 3 неконфликтующие пачки — использую текущие пачки целиком');
+        console.log(LOG, `ГА-поиск: перебрано бесконфликтных троек: ${totalChecked}`);
+
+        if (!best) {
+            console.log(LOG, 'ГА-поиск: ни одной бесконфликтной тройки не найдено');
             return null;
+        }
+
+        console.log(LOG, `ГА-поиск: лучшая тройка — P(2 из 3) = ${(bestScore * 100).toFixed(1)}% (${best.map(s => (s.prob * 100).toFixed(0) + '%').join(' × ')})`);
+
+        if (bestScore < MIN_PROBABILITY_TO_SAVE) {
+            console.log(LOG, `ГА-поиск: P(2 из 3) ${(bestScore * 100).toFixed(1)}% < порога ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}% — откат на текущие пачки`);
+            return null;
+        }
+
+        // ===== 4. Формируем результат =====
+        for (let i = 0; i < 3; i++) {
+            const s = best[i];
+            const defInfo = s.againstDefHeroes ? ` vs [${s.againstDefHeroes.join(',')}]|${s.againstDefPet || '-'}` : '';
+            console.log(LOG, `ГА-поиск: позиция #${i + 1} — [${s.heroes.join(',')}] активный=${s.pet || '—'} покр=[${s.favorPets.join(',') || '—'}] (${(s.prob * 100).toFixed(0)}%, ${s.source}${defInfo})`);
         }
 
         const mergedFavor = {};
-        for (const s of slots) Object.assign(mergedFavor, s.favor || {});
-
-        console.log(LOG, 'ГА-поиск: занятые пулы — активные: [' + [...usedPets].join(',') + '], покровители: [' + [...usedFavorPets].join(',') + ']');
-        console.log(LOG, `ГА-поиск: итог — ${slots.map((s, i) => `#${i + 1}: [${s.heroes.join(',')}] активный=${s.pet || '—'} покр=[${(s.favorPets || []).join(',') || '—'}] (${(s.prob * 100).toFixed(0)}%)`).join('; ')}`);
+        for (const s of best) Object.assign(mergedFavor, s.favor || {});
 
         return {
-            slots,
-            heroesArr: slots.map(s => s.heroes),
-            petsArr:   slots.map(s => s.pet),
+            slots: best,
+            heroesArr: best.map(s => s.heroes),
+            petsArr: best.map(s => s.pet),
             favor: mergedFavor,
-            stats: qualified.map(p => ({
-                position: p.position,
-                prob: p.prob,
-                wins: p.wins,
-                total: p.total,
-                vsDefHeroes: p.againstDefHeroes,
-                vsDefPet: p.againstDefPet,
+            p2of3: bestScore,
+            stats: best.map((s, i) => ({
+                position: i,
+                prob: s.prob,
+                wins: s.wins || 0,
+                total: s.total || 0,
+                source: s.source || 'unknown',
+                vsDefHeroes: s.againstDefHeroes || null,
+                vsDefPet: s.againstDefPet || null,
             })),
         };
     } catch (e) {
@@ -1339,7 +1544,6 @@ async function pickArenaEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempt
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const enemies = await Caller.send('arenaFindEnemies');
         if (!Array.isArray(enemies) || !enemies.length) throw new Error('Сервер не вернул соперников');
-
         const filtered = enemies.filter(e =>
             isEnemyAllowed(e, myClanId, noAttackFriendly) &&
             !(excludeSet && excludeSet.has(String(e.userId)))
@@ -1366,7 +1570,6 @@ async function pickGrandEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempt
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const enemies = await Caller.send('grandFindEnemies');
         if (!Array.isArray(enemies) || !enemies.length) throw new Error('Сервер не вернул соперников (ГА)');
-
         const filtered = enemies.filter(e =>
             isEnemyAllowed(e, myClanId, noAttackFriendly) &&
             !(excludeSet && excludeSet.has(String(e.userId)))
@@ -1398,7 +1601,6 @@ async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackP
         }
 
         const MIN_APPLY = MIN_PROBABILITY_TO_SAVE;
-
         console.log(LOG, `лучшие пачки (по simProbability):`);
         for (const a of alts) {
             const marker = a.exact > 0 ? '[точная защита]' : '[похожая защита]';
@@ -1430,16 +1632,38 @@ async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackP
 }
 
 async function findArenaTarget(settings, myClanId) {
-    const historyHasHighProb = await hasAnyHistoryAtOrAboveThreshold('arena');
-    console.log(LOG, `Арена: в истории есть бои >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%: ${historyHasHighProb}`);
+    const canSearch = settings.saveHistory && settings.useBestPackFromHistory;
+    await dedupBattlesIfNeeded(DB_STORE, DB_NAME);
+
+    let allHistory = [];
+    if (canSearch) {
+        try {
+            const db = new HWHClasses.Database(DB_NAME, DB_STORE);
+            await db.open();
+            allHistory = await dbGetAll(db);
+            console.log(LOG, `Арена: загружено ${allHistory.length} записей истории`);
+        } catch (e) { console.warn(LOG, 'не удалось загрузить историю Арены:', e); }
+    }
+
+    const hasAnyForDef = (defHeroes, defPet) => {
+        if (!allHistory.length) return false;
+        const targetKey = packKey(defHeroes, defPet);
+        return allHistory.some(r => {
+            if (typeof r.probability !== 'number' || r.probability < MIN_PROBABILITY_TO_SAVE) return false;
+            if (packKey(r.defenderPack, r.defenderPet) === targetKey) return true;
+            const sim = packSimilarity(r.defenderPack || [], defHeroes || []);
+            if (sim < 0.8) return false;
+            if (defPet && r.defenderPet && defPet !== r.defenderPet) return false;
+            return true;
+        });
+    };
 
     const checked = new Set();
 
     for (let iter = 1; iter <= SEARCH_MAX_ITER; iter++) {
         let enemy;
-        try {
-            enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0);
-        } catch (e) {
+        try { enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0); }
+        catch (e) {
             console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: нет непроверенных подходящих соперников`);
             await new Promise(r => setTimeout(r, 1000));
             continue;
@@ -1447,43 +1671,41 @@ async function findArenaTarget(settings, myClanId) {
 
         const uid = String(enemy.userId);
         checked.add(uid);
-
         const defHeroes = (enemy.heroes || []).filter(h => h.id < 6000).map(h => h.id);
         const defPet    = (enemy.heroes || []).find(h => h.id >= 6000)?.id || null;
 
-        let best = null;
-        if (settings.saveHistory && settings.useBestPackFromHistory) {
-            best = await tryUseBestPack('arena', defHeroes, defPet, null, null);
+        if (!canSearch) {
+            console.log(LOG, `Арена: поиск пачек выключен — атакуем текущей пачкой ${enemy.user?.name || enemy.userId}`);
+            return { enemy, best: null, defHeroes, defPet, checkedCount: checked.size };
         }
 
+        if (!hasAnyForDef(defHeroes, defPet)) {
+            console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: для ${enemy.user?.name || enemy.userId} в истории нет пачек >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%, ищем дальше (проверено: ${checked.size})`);
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
+            continue;
+        }
+
+        let best = null;
+        try { best = await tryUseBestPack('arena', defHeroes, defPet, null, null); } catch (e) {}
         if (best) {
             console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: найден соперник ${enemy.user?.name || enemy.userId} с пачкой ${(best.simProbability * 100).toFixed(0)}% (проверено: ${checked.size})`);
             return { enemy, best, defHeroes, defPet, checkedCount: checked.size };
         }
-
-        if (!historyHasHighProb) {
-            console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: истории >= порога нет — атакуем текущей пачкой ${enemy.user?.name || enemy.userId} (проверено: ${checked.size})`);
-            return { enemy, best: null, defHeroes, defPet, checkedCount: checked.size };
-        }
-
-        console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: соперник ${enemy.user?.name || enemy.userId} — нет пачки >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%, ищем дальше (проверено: ${checked.size})`);
+        console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: ${enemy.user?.name || enemy.userId} — пачка не найдена (фильтры/defenderFavor), ищем дальше (проверено: ${checked.size})`);
         await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
     }
 
     console.log(LOG, `Арена: за ${SEARCH_MAX_ITER} итераций пачка >= порога не найдена, переходим к фолбэку (до ${SEARCH_FALLBACK_ITER} итераций)`);
     for (let iter = 1; iter <= SEARCH_FALLBACK_ITER; iter++) {
         let enemy;
-        try {
-            enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0);
-        } catch (e) {
+        try { enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0); }
+        catch (e) {
             console.log(LOG, `Арена: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: нет подходящего соперника`);
             await new Promise(r => setTimeout(r, 1000));
             continue;
         }
-
         const defHeroes = (enemy.heroes || []).filter(h => h.id < 6000).map(h => h.id);
         const defPet    = (enemy.heroes || []).find(h => h.id >= 6000)?.id || null;
-
         console.log(LOG, `Арена: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: атакуем текущей пачкой ${enemy.user?.name || enemy.userId} (проверено ранее: ${checked.size})`);
         return { enemy, best: null, defHeroes, defPet, checkedCount: checked.size };
     }
@@ -1493,57 +1715,57 @@ async function findArenaTarget(settings, myClanId) {
 }
 
 async function findGrandTarget(settings, myClanId, heroesArr, petsArr, favor) {
-    const historyHasHighProb = await hasAnyHistoryAtOrAboveThreshold('grandArena');
-    console.log(LOG, `ГА: в истории есть бои >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%: ${historyHasHighProb}`);
+    const canSearch = settings.saveHistory && settings.useBestPackFromHistory;
+    await dedupBattlesIfNeeded(DB_STORE_GRAND, DB_NAME_GRAND);
 
     const checked = new Set();
 
     for (let iter = 1; iter <= SEARCH_MAX_ITER; iter++) {
         let enemy;
-        try {
-            enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0);
-        } catch (e) {
+        try { enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0); }
+        catch (e) {
             console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: нет непроверенных подходящих соперников`);
             await new Promise(r => setTimeout(r, 1000));
             continue;
         }
-
         const uid = String(enemy.userId);
         checked.add(uid);
 
-        let best = null;
-        const visibleTeams = (enemy.heroes || []).map(teamArr => ({
-            heroes: Array.isArray(teamArr) ? teamArr : Object.values(teamArr || {}),
-        }));
-        if (settings.saveHistory && settings.useBestPackFromHistory && visibleTeams.length) {
-            best = await findBestGrandPacks(visibleTeams, heroesArr, petsArr, favor);
-        }
-
-        if (best) {
-            console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: найден соперник ${enemy.user?.name || enemy.userId}, пачек >= порога: ${best.stats.length} (проверено: ${checked.size})`);
-            return { enemy, best, checkedCount: checked.size };
-        }
-
-        if (!historyHasHighProb) {
-            console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: истории >= порога нет — атакуем текущими пачками ${enemy.user?.name || enemy.userId} (проверено: ${checked.size})`);
+        if (!canSearch) {
+            console.log(LOG, `ГА: поиск пачек выключен — атакуем текущими пачками ${enemy.user?.name || enemy.userId}`);
             return { enemy, best: null, checkedCount: checked.size };
         }
 
-        console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: соперник ${enemy.user?.name || enemy.userId} — нет пачек >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%, ищем дальше (проверено: ${checked.size})`);
+        const visibleTeams = (enemy.heroes || []).map(teamArr => ({
+            heroes: Array.isArray(teamArr) ? teamArr : Object.values(teamArr || {}),
+        }));
+        if (!visibleTeams.length) {
+            console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: у ${enemy.user?.name || enemy.userId} нет видимых защит, ищем дальше`);
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
+            continue;
+        }
+
+        let best = null;
+        try { best = await findBestGrandPacks(visibleTeams, heroesArr, petsArr, favor); }
+        catch (e) { console.warn(LOG, 'findBestGrandPacks ошибка:', e); }
+
+        if (best) {
+            console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: найден ${enemy.user?.name || enemy.userId}, P(2 из 3) = ${(best.p2of3 * 100).toFixed(1)}% (проверено: ${checked.size})`);
+            return { enemy, best, checkedCount: checked.size };
+        }
+        console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: ${enemy.user?.name || enemy.userId} — тройка не набрана, ищем дальше (проверено: ${checked.size})`);
         await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
     }
 
-    console.log(LOG, `ГА: за ${SEARCH_MAX_ITER} итераций пачки >= порога не найдены, переходим к фолбэку (до ${SEARCH_FALLBACK_ITER} итераций)`);
+    console.log(LOG, `ГА: за ${SEARCH_MAX_ITER} итераций тройка >= порога не найдена, фолбэк на текущие пачки`);
     for (let iter = 1; iter <= SEARCH_FALLBACK_ITER; iter++) {
         let enemy;
-        try {
-            enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0);
-        } catch (e) {
+        try { enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0); }
+        catch (e) {
             console.log(LOG, `ГА: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: нет подходящего соперника`);
             await new Promise(r => setTimeout(r, 1000));
             continue;
         }
-
         console.log(LOG, `ГА: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: атакуем текущими пачками ${enemy.user?.name || enemy.userId} (проверено ранее: ${checked.size})`);
         return { enemy, best: null, checkedCount: checked.size };
     }
@@ -1574,8 +1796,7 @@ async function runArenaBattle() {
         if (!heroes.length) throw new Error('Нет пачки для Арены');
 
         const settings = loadSettings();
-        if (settings.onlyIfNoAttacksTodayArena && hadAttacksToday(userGetInfo, 'arena')) {
-            console.log(LOG, 'Арена: сегодня уже атаковали — пропуск');
+        if (settings.onlyIfNoAttacksTodayArena && await hadAttacksToday(userGetInfo, 'arena')) {
             HWHFuncs.setProgress('Арена: уже атаковали', 5000);
             return false;
         }
@@ -1584,10 +1805,7 @@ async function runArenaBattle() {
 
         HWHFuncs.setProgress('Арена: поиск соперника...', false);
         const target = await findArenaTarget(settings, userGetInfo?.clanId);
-        if (!target) {
-            HWHFuncs.setProgress('Арена: подходящий соперник не найден', 5000);
-            return false;
-        }
+        if (!target) { HWHFuncs.setProgress('Арена: подходящий соперник не найден', 5000); return false; }
         const { enemy, best, defHeroes, defPet } = target;
         console.log(LOG, 'Арена: бой с', enemy.user?.name || enemy.userId);
         console.log(LOG, `Арена: проверено уникальных соперников: ${target.checkedCount}`);
@@ -1604,7 +1822,7 @@ async function runArenaBattle() {
             favor = newFavor;
             console.log(LOG, `Арена: используем лучшую пачку: [${heroes.join(',')}] пет ${pet || '-'} (сим ${(best.simProbability * 100).toFixed(0)}%)`);
         } else {
-            console.log(LOG, 'Арена: истории >= порога нет — атакуем текущей пачкой');
+            console.log(LOG, 'Арена: атакуем текущей пачкой');
         }
 
         const args = { userId: +enemy.userId, heroes, favor };
@@ -1614,72 +1832,25 @@ async function runArenaBattle() {
         let result;
         try {
             result = await Caller.send({ name: 'arenaAttack', args });
-            if (result === null) {
-                console.warn(LOG, 'arenaAttack: сервер вернул null (возможно, ошибка сети или сессии)');
-                HWHFuncs.setProgress('Арена: сервер не ответил, попробуйте ещё раз', 5000);
-                return false;
-            }
+            if (result === null) { HWHFuncs.setProgress('Арена: сервер не ответил', 5000); return false; }
         } catch (e) {
             if (handleRefillError(e, 'arena')) return false;
             throw e;
         }
 
         await pruneOldBattlesIfNeeded();
-
         const resultShownAt = Date.now();
         reportBattleResult(result, 'Арена', 'arena');
-
-        const battle = result?.battles?.[0];
-        const heroesForSave = heroes.slice();
-        const petForSave = pet;
-        const favorForSave = { ...favor };
-        const defHeroesForSave = defHeroes.slice();
-        const defPetForSave = defPet;
-        const enemyForSave = enemy;
-        const userInfoForSave = userGetInfo;
 
         if (settings.saveHistory) {
             (async () => {
                 try {
-                    let probability = null;
-                    if (battle) {
-                        probability = await calcProbability(battle, SIM_COUNT);
-                        console.log(LOG, `Арена: probability = ${probability !== null ? (probability*100).toFixed(0) + '%' : 'н/д'}`);
-                    }
-                    if (probability !== null && probability >= MIN_PROBABILITY_TO_SAVE) {
-                        await saveBattleToDB({
-                            ts: Date.now(),
-                            attackerPack: heroesForSave.slice().sort((a, b) => a - b),
-                            attackerPet: petForSave,
-                            attackerFavor: favorForSave,
-                            defenderPack: defHeroesForSave.slice().sort((a, b) => a - b),
-                            defenderPet: defPetForSave,
-                            win: !!battle?.result?.win,
-                            probability,
-                            defenderName: enemyForSave.user?.name || '',
-                            defenderClanId: enemyForSave.user?.clanId ? String(enemyForSave.user.clanId) : null,
-                            attackerClanId: userInfoForSave?.clanId ? String(userInfoForSave.clanId) : null,
-                            source: 'arena',
-                            replayId: battle?.id
-                        });
-                    } else {
-                        const probStr = probability === null ? 'н/д' : `${(probability * 100).toFixed(0)}%`;
-                        console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
-                    }
-
-                    const elapsed = Date.now() - resultShownAt;
-                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
+                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - (Date.now() - resultShownAt));
                     if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
-
-                    await importArenaHistoryFromServer(1);
-                } catch (e) {
-                    console.warn(LOG, 'фоновый расчёт Арены ошибка:', e);
-                }
+                    await importArenaHistoryFromServer(1, 30000, true);
+                } catch (e) { console.warn(LOG, 'фоновый импорт Арены ошибка:', e); }
             })();
-        } else {
-            console.log(LOG, 'Арена: сохранение истории выключено — расчёт вероятности и запись в БД пропущены');
         }
-
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (Арена):', e);
@@ -1689,15 +1860,12 @@ async function runArenaBattle() {
 }
 
 async function readGrandDefense() {
-    const names = ['arenaGetAll', 'teamGetFavor', 'team_getBanners'];
-    const [arenaAll, favor, banners] = await Caller.send(names);
-
+    const [arenaAll, favor, banners] = await Caller.send(['arenaGetAll', 'teamGetFavor', 'team_getBanners']);
     const teams = arenaAll?.grandHeroes;
     if (!Array.isArray(teams) || teams.length === 0) throw new Error('grandArenaNotAvailable');
     if (teams.length !== 3) throw new Error('grandHeroes не содержит 3 пачки');
 
-    const heroes = [];
-    const pets = [];
+    const heroes = [], pets = [];
     for (const team of teams) {
         if (!Array.isArray(team)) throw new Error('Некорректный состав пачки');
         const units = team.map(u => Number(u?.id ?? u));
@@ -1707,14 +1875,11 @@ async function readGrandDefense() {
         heroes.push(teamHeroes);
         pets.push(teamPets[0] || 0);
     }
-
     const rawBanners = banners?.grand_def;
     if (!Array.isArray(rawBanners) || rawBanners.length !== 3) throw new Error('Нет grand_def флагов');
     const bannerIds = rawBanners.map(v => (v === null ? 0 : Number(v?.id ?? v)));
-
     const rawFavor = favor?.grand_def;
     const favorObj = (rawFavor && typeof rawFavor === 'object' && !Array.isArray(rawFavor)) ? { ...rawFavor } : {};
-
     return { heroes, pets, banners: bannerIds, favor: favorObj };
 }
 
@@ -1725,14 +1890,12 @@ async function shuffleGrandDefense() {
         const def = await readGrandDefense();
         const orders = [[1,0,2],[2,1,0],[0,2,1],[1,2,0],[2,0,1]];
         const order = orders[Math.floor(Math.random() * orders.length)];
-
         const args = {
-            heroes:  order.map(i => def.heroes[i].slice()),
-            pets:    order.map(i => def.pets[i]),
-            favor:   { ...def.favor },
+            heroes: order.map(i => def.heroes[i].slice()),
+            pets: order.map(i => def.pets[i]),
+            favor: { ...def.favor },
             banners: order.map(i => def.banners[i]),
         };
-
         const response = await Caller.send({ name: 'grandSetHeroes', args, ident: 'grandSetHeroes' });
         const rpcError = response?.error || response?.results?.find(r => r.result?.error)?.result.error;
         if (rpcError) throw new Error(rpcError.description || rpcError.message || 'Ошибка grandSetHeroes');
@@ -1759,9 +1922,7 @@ function startGrandShuffle() {
         if (!sm?.status) { setTimeout(startGrandShuffle, 1000); return; }
     } catch (e) { setTimeout(startGrandShuffle, 1000); return; }
 
-    const settings = loadSettings();
-    const intervalSec = Math.max(5, Math.min(3600, Number(settings.grandShuffleIntervalSec) || 15));
-
+    const intervalSec = Math.max(5, Math.min(3600, Number(loadSettings().grandShuffleIntervalSec) || 15));
     grandShuffleEnabled = true;
     console.log(LOG, `ГА: автосмена защиты запущена (каждые ${intervalSec} сек)`);
     try { HWHFuncs.setProgress(`ГА: автосмена защиты каждые ${intervalSec} сек`, 4000); } catch (e) {}
@@ -1770,8 +1931,7 @@ function startGrandShuffle() {
         if (!grandShuffleEnabled) return;
         try { await shuffleGrandDefense(); } catch (e) {}
         if (grandShuffleEnabled) {
-            const s = loadSettings();
-            const sec = Math.max(5, Math.min(3600, Number(s.grandShuffleIntervalSec) || 15));
+            const sec = Math.max(5, Math.min(3600, Number(loadSettings().grandShuffleIntervalSec) || 15));
             grandShuffleTimer = setTimeout(tick, sec * 1000);
         }
     };
@@ -1801,8 +1961,7 @@ async function runGrandArenaBattle() {
         const banners = [0, 1, 2].map(i => raw[i] || null);
 
         const settings = loadSettings();
-        if (settings.onlyIfNoAttacksTodayGrand && hadAttacksToday(userGetInfo, 'grandArena')) {
-            console.log(LOG, 'Гранд-арена: сегодня уже атаковали — пропуск');
+        if (settings.onlyIfNoAttacksTodayGrand && await hadAttacksToday(userGetInfo, 'grandArena')) {
             HWHFuncs.setProgress('Гранд-арена: уже атаковали', 5000);
             return false;
         }
@@ -1811,10 +1970,7 @@ async function runGrandArenaBattle() {
 
         HWHFuncs.setProgress('Гранд-арена: поиск соперника...', false);
         const target = await findGrandTarget(settings, userGetInfo?.clanId, heroesArr, petsArr, favor);
-        if (!target) {
-            HWHFuncs.setProgress('Гранд-арена: подходящий соперник не найден', 5000);
-            return false;
-        }
+        if (!target) { HWHFuncs.setProgress('Гранд-арена: подходящий соперник не найден', 5000); return false; }
         const { enemy, best } = target;
         console.log(LOG, 'Гранд-арена: бой с', enemy.user?.name || enemy.userId);
         console.log(LOG, `Гранд-арена: проверено уникальных соперников: ${target.checkedCount}`);
@@ -1824,85 +1980,41 @@ async function runGrandArenaBattle() {
             heroesArr = best.heroesArr.map((h, i) => h || heroesArr[i]);
             petsArr   = best.petsArr.map((p, i) => p !== null ? p : petsArr[i]);
             favor = best.favor;
-
-            console.log(LOG, `Гранд-арена: пачек >= порога: ${best.stats.length}`);
-            best.stats.forEach(s =>
-                console.log(`   позиция #${s.position + 1}: ${(s.prob * 100).toFixed(0)}% (${s.wins}/${s.total}) против [${s.vsDefHeroes.join(',')}]|${s.vsDefPet || '-'}`)
-            );
+            console.log(LOG, `Гранд-арена: P(2 из 3) = ${(best.p2of3 * 100).toFixed(1)}%`);
+            best.stats.forEach(s => {
+                const defInfo = s.vsDefHeroes
+                    ? ` vs [${s.vsDefHeroes.join(',')}]|${s.vsDefPet || '-'}`
+                    : ' (позиция скрыта или текущая пачка)';
+                console.log(`   позиция #${s.position + 1}: ${(s.prob * 100).toFixed(0)}% (${s.wins}/${s.total}, ${s.source})${defInfo}`);
+            });
             console.log(LOG, 'Гранд-арена: порядок пачек сохранён по позициям защит, флаги остаются на своих позициях');
         } else {
-            console.log(LOG, 'Гранд-арена: истории >= порога нет — атакуем текущими пачками');
+            console.log(LOG, 'Гранд-арена: атакуем текущими пачками');
         }
 
         const args = { userId: +enemy.userId, heroes: heroesArr, pets: petsArr, favor, banners };
-
         let result;
         try {
             result = await Caller.send({ name: 'grandAttack', args });
-            if (result == null) {
-                console.warn(LOG, 'grandAttack: сервер вернул null');
-                HWHFuncs.setProgress('Гранд-арена: сервер отклонил запрос, попробуйте позже', 5000);
-                return false;
-            }
+            if (result == null) { HWHFuncs.setProgress('Гранд-арена: сервер отклонил', 5000); return false; }
         } catch (e) {
             if (handleRefillError(e, 'grandArena')) return false;
             throw e;
         }
 
         await pruneOldBattlesIfNeeded();
-
         const resultShownAt = Date.now();
         reportBattleResult(result, 'Гранд-Арена', 'grandArena');
 
-        const battles = result?.battles || [];
-        const enemyForSave = enemy;
-        const userInfoForSave = userGetInfo;
         if (settings.saveHistory) {
             (async () => {
                 try {
-                    for (let i = 0; i < battles.length; i++) {
-                        const b = battles[i];
-                        const atk = extractPackFromTeam(b.attackers || {});
-                        const defArr = Array.isArray(b.defenders) ? b.defenders : [b.defenders];
-                        const def = extractPackFromTeam(defArr[0] || {});
-                        if (!atk.heroes.length) continue;
-
-                        const prob = await calcProbabilityForReplay(b);
-                        if (prob !== null && prob >= MIN_PROBABILITY_TO_SAVE) {
-                            await saveGrandBattleToDB({
-                                ts: Date.now() + i,
-                                replayId: b.id || `g_${enemyForSave.userId}_${Date.now()}_${i}`,
-                                defenderId: String(enemyForSave.userId),
-                                defenderName: enemyForSave.user?.name || '',
-                                defenderClanId: enemyForSave.user?.clanId ? String(enemyForSave.user.clanId) : null,
-                                attackerClanId: userInfoForSave?.clanId ? String(userInfoForSave.clanId) : null,
-                                attackerPack: atk.heroes,
-                                attackerPet: atk.pet,
-                                attackerFavor: atk.favor,
-                                defenderPack: def.heroes,
-                                defenderPet: def.pet,
-                                defenderFavor: def.favor,
-                                win: !!b.result?.win,
-                                probability: prob,
-                                battleOrder: b.result?.battleOrder ?? i,
-                                source: 'grandArena',
-                            });
-                        }
-                    }
-
-                    const elapsed = Date.now() - resultShownAt;
-                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
+                    const waitMs = Math.max(0, RESULT_DISPLAY_MS - (Date.now() - resultShownAt));
                     if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
-
-                    await importArenaHistoryFromServer(1);
-                } catch (e) {
-                    console.warn(LOG, 'фоновый расчёт ГА ошибка:', e);
-                }
+                    await importArenaHistoryFromServer(1, 30000, true);
+                } catch (e) { console.warn(LOG, 'фоновый импорт ГА ошибка:', e); }
             })();
-        } else {
-            console.log(LOG, 'ГА: сохранение истории выключено — расчёт вероятности и запись в БД пропущены');
         }
-
         return true;
     } catch (e) {
         console.error(LOG, 'ошибка (ГА):', e);
@@ -1911,6 +2023,7 @@ async function runGrandArenaBattle() {
     }
 }
 
+/* ===== Кнопки ===== */
 function ensureSquareButtonStyle() {
     const STYLE_ID = 'hwh-one-arena-square-btn-v5';
     if (document.getElementById(STYLE_ID)) return;
@@ -1956,30 +2069,9 @@ function installActionButtons() {
             arr.splice(i, 1);
         }
     }
-    arr.push({
-        __arena: true,
-        get msg() { return 'Провести 1 бой на Арене'; },
-        get title() { return 'Провести 1 бой на Арене текущей пачкой'; },
-        result() { runArenaBattle(); },
-        color: 'red',
-    });
-    arr.push({
-        __arenaSettings: true,
-        get msg() { return '⚙️'; },
-        get title() { return 'Настройки авто-боя'; },
-        result() { openSettingsDialog(); },
-        color: 'blue',
-        classes: ['fixedSquare'],
-    });
-    arr.push({
-        __grandArena: true,
-        get msg() { return 'Провести 1 бой на Гранд-Арене'; },
-        get title() { return 'Провести 1 бой на Гранд-Арене (3 пачки)'; },
-        result() { runGrandArenaBattle(); },
-        color: 'violet',
-    });
-
-    console.log(LOG, 'кнопки добавлены: Арена, ⚙️, Гранд-Арена');
+    arr.push({ __arena: true, get msg() { return 'Провести 1 бой на Арене'; }, result() { runArenaBattle(); }, color: 'red' });
+    arr.push({ __arenaSettings: true, get msg() { return '⚙️'; }, result() { openSettingsDialog(); }, color: 'blue', classes: ['fixedSquare'] });
+    arr.push({ __grandArena: true, get msg() { return 'Провести 1 бой на Гранд-Арене'; }, result() { runGrandArenaBattle(); }, color: 'violet' });
     return true;
 }
 function patchDoYourBest() {
@@ -1991,9 +2083,7 @@ function patchDoYourBest() {
     class Patched extends Original {
         constructor(...args) {
             super(...args);
-            this.funcList = (this.funcList || []).filter(
-                f => f.name !== 'oneArenaBattle' && f.name !== 'oneGrandArenaBattle'
-            );
+            this.funcList = (this.funcList || []).filter(f => f.name !== 'oneArenaBattle' && f.name !== 'oneGrandArenaBattle');
             const idx = this.funcList.findIndex(f => f.name === 'testDungeon');
             const arenaItem = { name: 'oneArenaBattle', label: 'Провести 1 бой на арене', checked: false };
             const grandItem = { name: 'oneGrandArenaBattle', label: 'Провести 1 бой на Гранд-Арене', checked: false };
@@ -2007,7 +2097,6 @@ function patchDoYourBest() {
     Patched.__patched = true;
     HWHClasses.doYourBest = Patched;
     globalThis.__HWHOneArena_doYourBestPatched = true;
-    console.log(LOG, 'галочки добавлены в "Сделать всё"');
     return true;
 }
 
@@ -2027,7 +2116,6 @@ const retryTimer = setInterval(() => {
     if (done || attempts >= maxAttempts) {
         clearInterval(retryTimer);
         if (done) console.log(`%c${LOG} v${GM_info.script.version} готов`, 'color: #7fff7f');
-        else console.warn(LOG, 'не удалось установить элементы за 60 сек');
     }
 }, 500);
 
@@ -2038,28 +2126,19 @@ try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
     const RETRY_MS = 1000;
     const MAX_RETRIES = 30;
     let attempts = 0;
-
     function tryStart() {
         attempts++;
         try {
-            if (!loadSettings().grandShuffle) {
-                console.log(LOG, 'ГА-автостарт: галочка выключена — пропуск');
-                return;
-            }
+            if (!loadSettings().grandShuffle) return;
             const sm = HWHClasses?.ScriptMenu?.getInst?.();
             if (!sm?.status) {
                 if (attempts < MAX_RETRIES) setTimeout(tryStart, RETRY_MS);
-                else console.warn(LOG, 'ГА-автостарт: HWH-меню не готово после', MAX_RETRIES, 'попыток');
                 return;
             }
-            if (grandShuffleEnabled) { console.log(LOG, 'ГА-автостарт: уже запущено'); return; }
-            console.log(LOG, 'ГА-автостарт: запуск');
+            if (grandShuffleEnabled) return;
             startGrandShuffle();
-        } catch (e) {
-            console.warn(LOG, 'ошибка автозапуска автосмены ГА:', e);
-        }
+        } catch (e) { console.warn(LOG, 'ошибка автозапуска автосмены ГА:', e); }
     }
-
     setTimeout(tryStart, START_DELAY_MS);
 })();
 })();
