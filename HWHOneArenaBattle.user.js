@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.18
+// @version      4.20
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666 with AI
@@ -19,7 +19,6 @@
 // @downloadURL  https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
-
 (async function () {
 'use strict';
 
@@ -44,7 +43,7 @@ const FRIENDLY_PLAYERS_SLOTS = 7;
 const SEARCH_MAX_ITER = 50;
 const SEARCH_FALLBACK_ITER = 10;
 const SEARCH_RETRY_DELAY_MS = 500;
-const RESULT_DISPLAY_MS = 2000;   // сколько держим «ПОБЕДА/ПОРАЖЕНИЕ» в статусе
+const RESULT_DISPLAY_MS = 2000;
 const REFILL = {
     arena:      { battle: 6,  cooldown: 5,  maxTries: 5, label: 'Арена' },
     grandArena: { battle: 21, cooldown: 20, maxTries: 5, label: 'Гранд-Арена' },
@@ -61,13 +60,11 @@ function colorRank(c) {
     return c in COLOR_PRIORITY ? COLOR_PRIORITY[c] : 6;
 }
 
-/* ===== Живой статус ===== */
 let liveStatusTimer = null;
 let liveStatusPrefix = '';
 let liveStatusStart = 0;
 let liveStatusHistory = [];
 
-/* ===== Автосмена ГА ===== */
 let grandShuffleTimer = null;
 let grandShuffleBusy = false;
 let grandShuffleEnabled = false;
@@ -104,7 +101,6 @@ function stopLiveStatus(finalMessage) {
     liveStatusHistory = [];
 }
 
-/* ===== ОЖИДАНИЕ HWH ===== */
 async function waitForHelper(timeout = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
@@ -125,7 +121,6 @@ try {
 
 const { Caller, HWHFuncs, HWHClasses, HWHData } = globalThis;
 
-/* ===== НАСТРОЙКИ ===== */
 const defaultSettings = {
     saveHistory: true,
     onlyIfNoAttacksTodayArena: false,
@@ -193,7 +188,6 @@ function saveSeenReplays(set) {
     }
 }
 
-/* ===== СПИСОК ГИЛЬДИЙ ===== */
 async function fetchAllClansFromServer() {
     const result = {};
     for (const league of [1, 2, 3, 4]) {
@@ -221,7 +215,6 @@ async function getAllClansCached(forceRefresh = false) {
     return data;
 }
 
-/* ===== ДИАЛОГ: базовые настройки ===== */
 async function openSettingsDialog() {
     const s = loadSettings();
     const result = await HWHFuncs.popup.confirm(
@@ -325,7 +318,6 @@ async function openSettingsDialog() {
     if (!newSettings.grandShuffle && grandShuffleEnabled) stopGrandShuffle();
 }
 
-/* ===== ДИАЛОГ: дружественные гильдии ===== */
 async function openFriendlyClansDialog() {
     HWHFuncs.setProgress('Загрузка списка гильдий...');
     const clans = await getAllClansCached();
@@ -369,7 +361,6 @@ async function openFriendlyClansDialog() {
     HWHFuncs.setProgress(`Дружественных гильдий: ${newFriends.length}`, 3000);
 }
 
-/* ===== ДИАЛОГ: друзья ===== */
 async function openFriendlyPlayersDialog() {
     let players = loadFriendlyPlayers().slice(0, FRIENDLY_PLAYERS_SLOTS);
     while (players.length < FRIENDLY_PLAYERS_SLOTS) players.push('');
@@ -426,7 +417,6 @@ async function openFriendlyPlayersDialog() {
     }
 }
 
-/* ===== ФИЛЬТР СОПЕРНИКОВ ===== */
 function isEnemyAllowed(enemy, myClanId, noAttackFriendly) {
     const settings = loadSettings();
 
@@ -442,7 +432,6 @@ function isEnemyAllowed(enemy, myClanId, noAttackFriendly) {
     return true;
 }
 
-/* ===== ФЛАГИ ===== */
 function getBannersFromGame() {
     try {
         const g = cheats.getSelfGame();
@@ -505,7 +494,6 @@ function pickBestBannerId() {
     return picked.id;
 }
 
-/* ===== ПОПЫТКИ / КУЛДАУНЫ ===== */
 function getRefill(userGetInfo, id) {
     try { return (userGetInfo?.refillable || []).find(x => x.id === id) || null; } catch (e) { return null; }
 }
@@ -519,7 +507,6 @@ function hadAttacksToday(userGetInfo, kind) {
     return tries < REFILL[kind].maxTries;
 }
 
-/* ===== ОШИБКИ ===== */
 function handleRefillError(e, kind) {
     const msg = String(e?.message || e);
     const ref = REFILL[kind];
@@ -541,7 +528,6 @@ function handleRefillError(e, kind) {
     return false;
 }
 
-/* ===== РЕЗУЛЬТАТ ===== */
 function reportBattleResult(result, label, kind) {
     const isGrand = kind === 'grandArena';
     const battles = result?.battles || [];
@@ -585,7 +571,6 @@ function reportBattleResult(result, label, kind) {
     }
 }
 
-/* ===== СИМУЛЯЦИЯ ВЕРОЯТНОСТИ ===== */
 async function calcProbability(battle, N = SIM_COUNT) {
     if (!battle || typeof Calc !== 'function') return null;
     let wins = 0, total = 0;
@@ -606,7 +591,6 @@ async function calcProbability(battle, N = SIM_COUNT) {
     return wins / total;
 }
 
-/* ===== INDEXEDDB ===== */
 function packKey(heroes, pet) {
     const sorted = (heroes || []).slice().sort((a, b) => a - b);
     return sorted.join(',') + '|' + (pet || '');
@@ -691,9 +675,6 @@ async function hasAnyHistoryAtOrAboveThreshold(kind) {
     }
 }
 
-/* ================================================================= */
-/* === ИМПОРТ ИСТОРИИ ИЗ battleGetByType                           = */
-/* ================================================================= */
 function extractPackFromTeam(teamObj) {
     const units = Object.values(teamObj || {}).filter(u => u && u.id);
     const heroes = units.filter(u => u.id < 6000).map(u => u.id).sort((a, b) => a - b);
@@ -934,8 +915,6 @@ async function importArenaHistoryFromServer(maxPages = Infinity) {
     return totalImported;
 }
 
-/* === Экспорт / Импорт IndexedDB в файл === */
-
 async function exportAllDB() {
     try {
         const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
@@ -1070,9 +1049,6 @@ async function openHistoryDialog() {
     else if (result === 'server') await importArenaHistoryFromServer();
 }
 
-/**
- * Насколько похожи две пачки героев.
- */
 function packSimilarity(a, b) {
     if (!a?.length || !b?.length) return 0;
     const setB = new Set(b);
@@ -1159,6 +1135,7 @@ async function findBestAttackerPacks(defenderHeroes, defenderPet, topN = 5) {
     }
 }
 
+/* === ГЛАВНАЯ ПРАВКА: pet и favor — раздельные пулы, внутрипачечная уникальность favor === */
 async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPetsArr, currentFavor) {
     if (!HWHClasses.Database) {
         console.log(LOG, 'ГА-поиск: HWHClasses.Database недоступен');
@@ -1178,14 +1155,31 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             return null;
         }
 
-        const slots = [null, null, null];
+        // Хелпер: извлечь список покровителей из favor-объекта с защитой от внутренних дублей
+        const favorPetValues = (favor) => {
+            const vals = Object.values(favor || {}).filter(Boolean).map(Number);
+            const seen = new Set();
+            const uniq = [];
+            for (const v of vals) {
+                if (seen.has(v)) {
+                    // внутренний дубль в одной пачке — невалидная пачка, отбрасываем
+                    return { uniq: [], invalid: true };
+                }
+                seen.add(v);
+                uniq.push(v);
+            }
+            return { uniq, invalid: false };
+        };
 
+        // 1) Собираем кандидатов по каждой защите (отсортированы по вероятности)
+        const candidatesByDef = [];
         for (let defIdx = 0; defIdx < enemyVisibleTeams.length && defIdx < 3; defIdx++) {
             const defTeam = enemyVisibleTeams[defIdx];
             const defHeroes = (defTeam.heroes || []).filter(h => h.id < 6000).map(h => h.id);
             const defPet    = (defTeam.heroes || []).find(h => h.id >= 6000)?.id || null;
             if (!defHeroes.length) {
                 console.log(LOG, `ГА-поиск: защита #${defIdx + 1} без героев, пропуск`);
+                candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: [] });
                 continue;
             }
 
@@ -1201,17 +1195,22 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             }
             if (!source.length) {
                 console.log(LOG, `ГА-поиск: защита #${defIdx + 1} — матчей нет`);
+                candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: [] });
                 continue;
             }
 
             const byAtk = new Map();
             for (const r of source) {
+                const fv = favorPetValues(r.attackerFavor);
+                if (fv.invalid) continue;   // пачка с дублями покровителей внутри — пропуск
+
                 const atkKey = packKey(r.attackerPack, r.attackerPet);
                 if (!byAtk.has(atkKey)) {
                     byAtk.set(atkKey, {
                         heroes: r.attackerPack,
                         pet: r.attackerPet,
                         favor: r.attackerFavor || {},
+                        favorPets: fv.uniq,     // массив покровителей без дублей
                         wins: 0, total: 0, simSum: 0, simCount: 0,
                     });
                 }
@@ -1221,18 +1220,46 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
                 if (typeof r.probability === 'number') { e.simSum += r.probability; e.simCount++; }
             }
 
-            let best = null;
+            const cands = [];
             for (const e of byAtk.values()) {
                 e.prob = e.simCount > 0 ? e.simSum / e.simCount : (e.wins / e.total);
-                if (!best || e.prob > best.prob) best = e;
+                cands.push(e);
             }
-            if (best) {
-                slots[defIdx] = {
-                    ...best,
-                    position: defIdx,
-                    againstDefHeroes: defHeroes,
-                    againstDefPet: defPet,
-                };
+            cands.sort((a, b) => b.prob - a.prob);
+            console.log(LOG, `ГА-поиск: защита #${defIdx + 1} — кандидатов: ${cands.length} (лучший ${cands[0] ? (cands[0].prob * 100).toFixed(0) + '%' : '—'})`);
+            candidatesByDef.push({ defIdx, defHeroes, defPet, candidates: cands });
+        }
+
+        // 2) Жадный выбор с учётом:
+        //    - герой: 1 раз на 3 пачки
+        //    - активный пет: 1 раз на 3 пачки
+        //    - пет-покровитель: 1 раз на 3 пачки
+        //    pet и favor — РАЗНЫЕ пулы, пересечение между ними разрешено.
+        const slots = [null, null, null];
+        const usedHeroes = new Set();
+        const usedPets = new Set();          // активные петы
+        const usedFavorPets = new Set();     // покровители
+
+        for (const { defIdx, defHeroes, defPet, candidates } of candidatesByDef) {
+            let picked = null;
+            for (const c of candidates) {
+                if (c.prob < MIN_PROBABILITY_TO_SAVE) continue;
+                if ((c.heroes || []).some(h => usedHeroes.has(h))) continue;
+                if (c.pet && usedPets.has(c.pet)) continue;
+                if ((c.favorPets || []).some(fp => usedFavorPets.has(fp))) continue;
+
+                picked = { ...c, position: defIdx, againstDefHeroes: defHeroes, againstDefPet: defPet };
+                break;
+            }
+            if (picked) {
+                slots[defIdx] = picked;
+                picked.heroes.forEach(h => usedHeroes.add(h));
+                if (picked.pet) usedPets.add(picked.pet);
+                (picked.favorPets || []).forEach(fp => usedFavorPets.add(fp));
+                const favList = (picked.favorPets || []).join(',') || '—';
+                console.log(LOG, `ГА-поиск: позиция #${defIdx + 1} — [${picked.heroes.join(',')}] активный=${picked.pet || '—'} покровители=[${favList}] (${(picked.prob * 100).toFixed(0)}%)`);
+            } else {
+                console.log(LOG, `ГА-поиск: позиция #${defIdx + 1} — подходящей пачки без конфликтов нет`);
             }
         }
 
@@ -1242,40 +1269,56 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             return null;
         }
 
-        console.log(LOG, `ГА-поиск: пачек >= порога: ${qualified.length} (${slots.map((s, i) => s ? `#${i + 1}:${(s.prob * 100).toFixed(0)}%` : `#${i + 1}:—`).join(', ')})`);
-
-        const usedHeroes = new Set();
-        for (const s of slots) if (s) s.heroes.forEach(h => usedHeroes.add(h));
-
+        // 3) Свободные позиции добиваем текущими пачками — тоже без конфликтов
         for (let pos = 0; pos < 3; pos++) {
             if (slots[pos]) continue;
             for (let i = 0; i < currentHeroesArr.length; i++) {
                 const pack = currentHeroesArr[i];
                 if (!pack || pack.some(h => usedHeroes.has(h))) continue;
-                slots[pos] = { heroes: pack, pet: currentPetsArr[i] || null, favor: currentFavor || {}, prob: 0, position: pos, fallback: true };
+
+                const pet = currentPetsArr[i] || null;
+                if (pet && usedPets.has(pet)) continue;
+
+                const favorForSlot = {};
+                for (const h of pack) if (currentFavor?.[h]) favorForSlot[h] = currentFavor[h];
+                const fv = favorPetValues(favorForSlot);
+                if (fv.invalid) continue;
+                if (fv.uniq.some(fp => usedFavorPets.has(fp))) continue;
+
+                slots[pos] = {
+                    heroes: pack,
+                    pet,
+                    favor: favorForSlot,
+                    favorPets: fv.uniq,
+                    prob: 0,
+                    position: pos,
+                    fallback: true,
+                };
                 pack.forEach(h => usedHeroes.add(h));
+                if (pet) usedPets.add(pet);
+                fv.uniq.forEach(fp => usedFavorPets.add(fp));
+                console.log(LOG, `ГА-поиск: позиция #${pos + 1} — добивка текущей пачкой [${pack.join(',')}] активный=${pet || '—'} покровители=[${fv.uniq.join(',') || '—'}]`);
                 break;
             }
         }
-        for (let pos = 0; pos < 3; pos++) {
-            if (slots[pos]) continue;
-            for (let i = 0; i < currentHeroesArr.length; i++) {
-                const pack = currentHeroesArr[i];
-                if (!pack) continue;
-                const already = slots.some(s => s && s.heroes.length === pack.length && pack.every((h, k) => s.heroes[k] === h));
-                if (already) continue;
-                slots[pos] = { heroes: pack, pet: currentPetsArr[i] || null, favor: currentFavor || {}, prob: 0, position: pos, fallback: true };
-                break;
-            }
+
+        // 4) Если 3 неконфликтующие пачки собрать не удалось — возвращаем null,
+        //    чтобы атаковать всеми текущими пачками (они валидны по определению).
+        if (slots.some(s => !s)) {
+            console.log(LOG, 'ГА-поиск: не удалось собрать 3 неконфликтующие пачки — использую текущие пачки целиком');
+            return null;
         }
 
         const mergedFavor = {};
-        for (const s of slots) if (s) Object.assign(mergedFavor, s.favor || {});
+        for (const s of slots) Object.assign(mergedFavor, s.favor || {});
+
+        console.log(LOG, 'ГА-поиск: занятые пулы — активные: [' + [...usedPets].join(',') + '], покровители: [' + [...usedFavorPets].join(',') + ']');
+        console.log(LOG, `ГА-поиск: итог — ${slots.map((s, i) => `#${i + 1}: [${s.heroes.join(',')}] активный=${s.pet || '—'} покр=[${(s.favorPets || []).join(',') || '—'}] (${(s.prob * 100).toFixed(0)}%)`).join('; ')}`);
 
         return {
             slots,
-            heroesArr: slots.map(s => s ? s.heroes : null),
-            petsArr:   slots.map(s => s ? s.pet   : null),
+            heroesArr: slots.map(s => s.heroes),
+            petsArr:   slots.map(s => s.pet),
             favor: mergedFavor,
             stats: qualified.map(p => ({
                 position: p.position,
@@ -1292,7 +1335,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
     }
 }
 
-/* ===== ПОИСК СОПЕРНИКОВ ===== */
 async function pickArenaEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempts = 10, delayMs = 1500) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const enemies = await Caller.send('arenaFindEnemies');
@@ -1347,7 +1389,6 @@ async function pickGrandEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempt
     throw new Error('Не удалось найти соперника (ГА)');
 }
 
-/* ===== ВЫБОР ПАЧКИ ===== */
 async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackPet) {
     try {
         const alts = await findBestAttackerPacks(defHeroes, defPet, 5);
@@ -1388,7 +1429,6 @@ async function tryUseBestPack(kind, defHeroes, defPet, fallbackHeroes, fallbackP
     }
 }
 
-/* ===== ПОИСК ЦЕЛИ ===== */
 async function findArenaTarget(settings, myClanId) {
     const historyHasHighProb = await hasAnyHistoryAtOrAboveThreshold('arena');
     console.log(LOG, `Арена: в истории есть бои >= ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%: ${historyHasHighProb}`);
@@ -1512,7 +1552,6 @@ async function findGrandTarget(settings, myClanId, heroesArr, petsArr, favor) {
     return null;
 }
 
-/* ===== АРЕНА ===== */
 async function runArenaBattle() {
     console.log(LOG, '=== Арена ===');
     HWHFuncs.setProgress('Арена: подготовка...');
@@ -1628,7 +1667,6 @@ async function runArenaBattle() {
                         console.log(LOG, `Арена: бой не сохранён — probability ${probStr} < ${Math.round(MIN_PROBABILITY_TO_SAVE * 100)}%`);
                     }
 
-                    // Даём статусу «ПОБЕДА/ПОРАЖЕНИЕ» отвисеть свои RESULT_DISPLAY_MS — как на ГА
                     const elapsed = Date.now() - resultShownAt;
                     const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
                     if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
@@ -1650,7 +1688,6 @@ async function runArenaBattle() {
     }
 }
 
-/* ===== АВТОСМЕНА ЗАЩИТЫ ГА ===== */
 async function readGrandDefense() {
     const names = ['arenaGetAll', 'teamGetFavor', 'team_getBanners'];
     const [arenaAll, favor, banners] = await Caller.send(names);
@@ -1748,7 +1785,6 @@ function stopGrandShuffle() {
     try { HWHFuncs.setProgress('ГА: автосмена защиты остановлена', 4000); } catch (e) {}
 }
 
-/* ===== ГРАНД-АРЕНА ===== */
 async function runGrandArenaBattle() {
     console.log(LOG, '=== Гранд-Арена ===');
     HWHFuncs.setProgress('Гранд-Арена: подготовка...');
@@ -1854,7 +1890,6 @@ async function runGrandArenaBattle() {
                         }
                     }
 
-                    // Та же логика: держим «ПОБЕДА/ПОРАЖЕНИЕ» ровно RESULT_DISPLAY_MS от показа
                     const elapsed = Date.now() - resultShownAt;
                     const waitMs = Math.max(0, RESULT_DISPLAY_MS - elapsed);
                     if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
@@ -1876,7 +1911,6 @@ async function runGrandArenaBattle() {
     }
 }
 
-/* ===== КНОПКИ ===== */
 function ensureSquareButtonStyle() {
     const STYLE_ID = 'hwh-one-arena-square-btn-v5';
     if (document.getElementById(STYLE_ID)) return;
@@ -1999,7 +2033,6 @@ const retryTimer = setInterval(() => {
 
 try { HWHFuncs.Events.on('startGame', () => tryInstallAll()); } catch (e) {}
 
-/* ===== АВТОСТАРТ АВТОСМЕНЫ ГА ===== */
 (function scheduleGrandShuffleAutoStart() {
     const START_DELAY_MS = 30000;
     const RETRY_MS = 1000;
