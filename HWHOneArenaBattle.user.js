@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.25
+// @version      4.26
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666 with AI
@@ -19,7 +19,6 @@
 // @downloadURL  https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // @updateURL    https://raw.githubusercontent.com/emz13666/HWHOneArenaBattle/main/HWHOneArenaBattle.user.js
 // ==/UserScript==
-
 
 (async function () {
 'use strict';
@@ -42,6 +41,7 @@ const IMPORT_REPLAY_DELAY_MS = 100;     // пауза между реплеям�
 const IMPORT_TIMEOUT_MS = 30000;        // общий таймаут импорта по умолчанию
 const MIN_PROBABILITY_DEFAULT = 0.5;
 let MIN_PROBABILITY_TO_SAVE = MIN_PROBABILITY_DEFAULT;
+let __importRunning = false;
 
 // seenReplays -> IndexedDB
 const SEEN_REPLAYS_DB = 'HWHOneArenaBattle_Meta';
@@ -85,37 +85,6 @@ let grandShuffleTimer = null;
 let grandShuffleBusy = false;
 let grandShuffleEnabled = false;
 
-function startLiveStatus(prefix) {
-    stopLiveStatus();
-    liveStatusPrefix = prefix;
-    liveStatusStart = Date.now();
-    const render = () => {
-        const elapsed = ((Date.now() - liveStatusStart) / 1000).toFixed(1);
-        const hist = liveStatusHistory.slice(-3).join('<br>');
-        const line = `${liveStatusPrefix} (${elapsed}с)`;
-        HWHFuncs.setProgress(hist ? `${hist}<br>${line}` : line, false);
-    };
-    render();
-    liveStatusTimer = setInterval(render, 200);
-}
-
-function pushLiveStatus(line) {
-    liveStatusHistory.push(line);
-    if (liveStatusHistory.length > 3) liveStatusHistory.shift();
-}
-
-function stopLiveStatus(finalMessage) {
-    if (liveStatusTimer) {
-        clearInterval(liveStatusTimer);
-        liveStatusTimer = null;
-    }
-    if (finalMessage) {
-        pushLiveStatus(finalMessage);
-        const hist = liveStatusHistory.slice(-3).join('<br>');
-        HWHFuncs.setProgress(hist, false);
-    }
-    liveStatusHistory = [];
-}
 
 async function waitForHelper(timeout = 60000) {
     const start = Date.now();
@@ -973,8 +942,19 @@ async function calcProbabilityForReplay(replay, N = SIM_COUNT_LIVE) {
 /* ===== Импорт истории ===== */
 async function importArenaHistoryFromServer(maxPages = Infinity, timeoutMs = IMPORT_TIMEOUT_MS, silent = false) {
     if (!HWHClasses.Database) { console.log(LOG, 'импорт: HWHClasses.Database недоступен'); return 0; }
+
+    if (__importRunning) {
+        console.log(LOG, 'импорт: уже выполняется, новый вызов пропущен');
+        return 0;
+    }
+    __importRunning = true;
+
     const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
-    if (!myUserId) { console.log(LOG, 'импорт истории: нет userInfo.id'); return 0; }
+    if (!myUserId) {
+        console.log(LOG, 'импорт истории: нет userInfo.id');
+        __importRunning = false;
+        return 0;
+    }
 
     await migrateSeenReplaysFromLocalStorage();
     await dedupBattlesIfNeeded(DB_STORE, DB_NAME);
@@ -1110,6 +1090,7 @@ async function importArenaHistoryFromServer(maxPages = Infinity, timeoutMs = IMP
     } else {
         if (!silent) HWHFuncs.setProgress(summary, 6000);
     }
+    __importRunning = false;
     return totalImported;
 }
 
