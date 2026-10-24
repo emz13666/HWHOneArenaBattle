@@ -2,7 +2,7 @@
 // @name         HWHOneArenaBattle
 // @name:ru      Авто-бой на арене
 // @namespace    HWHOneArenaBattle
-// @version      4.26
+// @version      4.27
 // @description  Conducts Arena/Grand Arena battles. Filter friendly clans. Saves battle history to IndexedDB with simProbability and auto-picks best attacker pack.
 // @description:ru Проводит бой на Арене/Гранд-Арене. Фильтр дружественных гильдий. Сохраняет историю боёв в IndexedDB с simProbability и автовыбирает лучшую пачку атаки.
 // @author       emz13666 with AI
@@ -56,7 +56,7 @@ const DEDUP_KEY_PREFIX = 'HWHOneArenaBattle.dedup.v1.';
 const DEDUP_TIMEOUT_MS = 15000;
 
 const FRIENDLY_PLAYERS_SLOTS = 7;
-const SEARCH_MAX_ITER = 25;
+const SEARCH_MAX_ITER = 20;
 const SEARCH_FALLBACK_ITER = 10;
 const SEARCH_RETRY_DELAY_MS = 500;
 const RESULT_DISPLAY_MS = 2000;
@@ -787,7 +787,7 @@ function reportBattleResult(result, label, kind) {
     }
 }
 
-async function calcProbability(battle, N = SIM_COUNT_LIVE, yieldMs = 100) {
+async function calcProbability(battle, N = SIM_COUNT_LIVE, yieldMs = 50) {
     if (!battle || typeof Calc !== 'function') return null;
     let wins = 0, total = 0;
     for (let i = 0; i < N; i++) {
@@ -949,19 +949,21 @@ async function importArenaHistoryFromServer(maxPages = Infinity, timeoutMs = IMP
     }
     __importRunning = true;
 
-    const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
-    if (!myUserId) {
-        console.log(LOG, 'импорт истории: нет userInfo.id');
-        __importRunning = false;
-        return 0;
-    }
+    try {
+        const myUserId = String(HWHFuncs.getUserInfo()?.id || '');
+        if (!myUserId) {
+            console.log(LOG, 'импорт истории: нет userInfo.id');
+            return 0;
+        }
 
-    await migrateSeenReplaysFromLocalStorage();
-    await dedupBattlesIfNeeded(DB_STORE, DB_NAME);
-    await dedupBattlesIfNeeded(DB_STORE_GRAND, DB_NAME_GRAND);
+        await migrateSeenReplaysFromLocalStorage();
+        await dedupBattlesIfNeeded(DB_STORE, DB_NAME);
+        await dedupBattlesIfNeeded(DB_STORE_GRAND, DB_NAME_GRAND);
 
-    const seenMap = await seenReplaysGetAllMap();
-    console.log(LOG, `seenReplays: ${seenMap.size} записей`);
+        const seenMap = await seenReplaysGetAllMap();
+        console.log(LOG, `seenReplays: ${seenMap.size} записей`);
+
+
 
     const dbA = new HWHClasses.Database(DB_NAME, DB_STORE);
     await dbA.open();
@@ -1084,14 +1086,16 @@ async function importArenaHistoryFromServer(maxPages = Infinity, timeoutMs = IMP
     const summary = `История: +${totalImported} (без ре-сим ${totalReimported}), симулировано ${totalSimulated}, низкий шанс ${totalSkippedLowProb}, дублей ${totalDuplicates}, чужих ${totalForeign}`;
     console.log(LOG, summary);
 
-    if (timedOut) {
-        console.log(LOG, `импорт прерван по таймауту (${timeoutMs / 1000} сек)`);
-        if (!silent) HWHFuncs.setProgress(`История: прервано по таймауту`, 4000);
-    } else {
-        if (!silent) HWHFuncs.setProgress(summary, 6000);
+        if (timedOut) {
+            console.log(LOG, `импорт прерван по таймауту (${timeoutMs / 1000} сек)`);
+            if (!silent) HWHFuncs.setProgress(`История: прервано по таймауту`, 4000);
+        } else {
+            if (!silent) HWHFuncs.setProgress(summary, 6000);
+        }
+        return totalImported;
+    } finally {
+        __importRunning = false;
     }
-    __importRunning = false;
-    return totalImported;
 }
 
 async function exportAllDB() {
@@ -1310,6 +1314,13 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
             return { uniq, invalid: false };
         };
 
+        // ГА использует только записи, где defenderFavor реально был записан
+        const hasDefenderFavor = (r) => {
+            const f = r.defenderFavor;
+            if (!f || typeof f !== 'object') return false;
+            return Object.keys(f).some(k => f[k] != null);
+        };
+
         // ===== 1. Текущие пачки игрока (все 3, для всех позиций) =====
         const currentPacks = [];
         for (let i = 0; i < Math.min(3, currentHeroesArr.length); i++) {
@@ -1346,9 +1357,12 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
 
                 if (defHeroes.length) {
                     const targetKey = packKey(defHeroes, defPet);
-                    let source = all.filter(r => packKey(r.defenderPack, r.defenderPet) === targetKey);
+                    // 5.1: точное совпадение + только записи с defenderFavor
+                    let source = all.filter(r => hasDefenderFavor(r) && packKey(r.defenderPack, r.defenderPet) === targetKey);
                     if (!source.length) {
+                        // 5.2: похожие защиты + только записи с defenderFavor
                         source = all.filter(r => {
+                            if (!hasDefenderFavor(r)) return false;
                             const sim = packSimilarity(r.defenderPack || [], defHeroes);
                             if (sim < 0.8) return false;
                             if (defPet && r.defenderPet && defPet !== r.defenderPet) return false;
@@ -1400,6 +1414,8 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
 
                 const allByAtk = new Map();
                 for (const r of all) {
+                    // 5.3: только записи с defenderFavor
+                    if (!hasDefenderFavor(r)) continue;
                     const fv = favorPetValues(r.attackerFavor);
                     if (fv.invalid) continue;
                     const atkKey = packKey(r.attackerPack, r.attackerPet);
@@ -1520,7 +1536,6 @@ async function findBestGrandPacks(enemyVisibleTeams, currentHeroesArr, currentPe
         return null;
     }
 }
-
 async function pickArenaEnemy(myClanId, noAttackFriendly, excludeSet, maxAttempts = 10, delayMs = 1500) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const enemies = await Caller.send('arenaFindEnemies');
@@ -1625,11 +1640,16 @@ async function findArenaTarget(settings, myClanId) {
             console.log(LOG, `Арена: загружено ${allHistory.length} записей истории`);
         } catch (e) { console.warn(LOG, 'не удалось загрузить историю Арены:', e); }
     }
-
+    const hasDefenderFavor = (r) => {
+        const f = r.defenderFavor;
+        if (!f || typeof f !== 'object') return false;
+        return Object.keys(f).some(k => f[k] != null);
+    };
     const hasAnyForDef = (defHeroes, defPet) => {
         if (!allHistory.length) return false;
         const targetKey = packKey(defHeroes, defPet);
         return allHistory.some(r => {
+            if (!hasDefenderFavor(r)) return false;
             if (typeof r.probability !== 'number' || r.probability < MIN_PROBABILITY_TO_SAVE) return false;
             if (packKey(r.defenderPack, r.defenderPet) === targetKey) return true;
             const sim = packSimilarity(r.defenderPack || [], defHeroes || []);
@@ -1646,7 +1666,7 @@ async function findArenaTarget(settings, myClanId) {
         try { enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0); }
         catch (e) {
             console.log(LOG, `Арена: итерация ${iter}/${SEARCH_MAX_ITER}: нет непроверенных подходящих соперников`);
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
             continue;
         }
 
@@ -1682,7 +1702,7 @@ async function findArenaTarget(settings, myClanId) {
         try { enemy = await pickArenaEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0); }
         catch (e) {
             console.log(LOG, `Арена: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: нет подходящего соперника`);
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
             continue;
         }
         const defHeroes = (enemy.heroes || []).filter(h => h.id < 6000).map(h => h.id);
@@ -1706,7 +1726,7 @@ async function findGrandTarget(settings, myClanId, heroesArr, petsArr, favor) {
         try { enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, checked, 1, 0); }
         catch (e) {
             console.log(LOG, `ГА: итерация ${iter}/${SEARCH_MAX_ITER}: нет непроверенных подходящих соперников`);
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
             continue;
         }
         const uid = String(enemy.userId);
@@ -1744,7 +1764,7 @@ async function findGrandTarget(settings, myClanId, heroesArr, petsArr, favor) {
         try { enemy = await pickGrandEnemy(myClanId, settings.noAttackFriendlyClans, null, 1, 0); }
         catch (e) {
             console.log(LOG, `ГА: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: нет подходящего соперника`);
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, SEARCH_RETRY_DELAY_MS));
             continue;
         }
         console.log(LOG, `ГА: фолбэк ${iter}/${SEARCH_FALLBACK_ITER}: атакуем текущими пачками ${enemy.user?.name || enemy.userId} (проверено ранее: ${checked.size})`);
